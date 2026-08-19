@@ -1,0 +1,7 @@
+config:
+  MD013: false
+  MD024:
+    siblings_only: true
+  MD036: false
+  MD060:
+    style: compact

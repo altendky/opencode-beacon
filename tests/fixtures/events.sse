@@ -1,0 +1,24 @@
+: heartbeat
+
+event: message
+data: {"type":"session.status","properties":{"sessionID":"ses_busy","status":{"type":"busy"}}}
+
+event: message
+data: {"type":"session.error","properties":{"sessionID":"ses_busy","error":{"name":"MessageAbortedError","message":"aborted"}}}
+
+event: message
+data: {"type":"session.updated","properties":{"info":{"id":"ses_idle","title":"Updated child","slug":"updated-child","parentID":"ses_busy"}}}
+
+event: message
+data: {"type":"question.asked","properties":{"id":"que_1","sessionID":"ses_idle","questions":[{"question":"private question"}]}}
+
+event: message
+data: {"type":"permission.asked","properties":{"id":"per_1","sessionID":"ses_idle","permission":"bash","patterns":["private pattern"]}}
+
+event: message
+data: {"type":"question.rejected","properties":{"requestID":"que_1"}}
+
+event: message
+data: {"type":"permission.replied","properties":{"requestID":"per_1","reply":"once"}}
+
+: end

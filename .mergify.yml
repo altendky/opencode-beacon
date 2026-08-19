@@ -1,0 +1,16 @@
+queue_rules:
+  - name: default
+    queue_conditions:
+      - label = enqueue
+      - base = main
+      - -draft
+    merge_method: merge
+
+pull_request_rules:
+  - name: queue approved changes
+    conditions:
+      - label = enqueue
+      - base = main
+      - -draft
+    actions:
+      queue:

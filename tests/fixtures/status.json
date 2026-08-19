@@ -1,0 +1,4 @@
+{
+  "ses_busy":{"type":"busy"},
+  "ses_retry":{"type":"retry","attempt":2,"message":"retry later","next":1234}
+}

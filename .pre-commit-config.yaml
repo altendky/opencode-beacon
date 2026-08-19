@@ -1,0 +1,82 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-toml
+      - id: check-yaml
+      - id: check-merge-conflict
+
+  - repo: https://github.com/crate-ci/typos
+    rev: v1.47.2
+    hooks:
+      - id: typos
+
+  - repo: https://github.com/DavidAnson/markdownlint-cli2
+    rev: v0.22.1
+    hooks:
+      - id: markdownlint-cli2
+
+  - repo: https://github.com/lycheeverse/lychee
+    rev: lychee-v0.24.2
+    hooks:
+      - id: lychee-system
+        args: ["--no-progress", "--config=.lychee.toml"]
+        types: [markdown]
+
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.7.12
+    hooks:
+      - id: actionlint
+
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: bash scripts/cargo-pinned.sh fmt --all --check
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: bash scripts/cargo-pinned.sh clippy --locked --all-targets --all-features -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-nextest
+        name: cargo nextest
+        entry: bash scripts/cargo-pinned.sh nextest run --locked --all-features
+        language: system
+        pass_filenames: false
+        stages: [manual]
+
+      - id: cargo-deny
+        name: cargo deny
+        entry: bash scripts/cargo-pinned.sh deny check
+        language: system
+        pass_filenames: false
+        stages: [manual]
+
+      - id: mise-lock
+        name: mise lock
+        entry: mise install --locked --dry-run
+        language: system
+        files: (^mise\.toml$|^mise\.lock$)
+        pass_filenames: false
+
+      - id: mdbook-build
+        name: mdbook build
+        entry: mise exec -- mdbook build docs
+        language: system
+        files: ^docs/
+        pass_filenames: false
+
+      - id: mdbook-test
+        name: mdbook test
+        entry: mise exec -- mdbook test docs
+        language: system
+        files: ^docs/
+        pass_filenames: false

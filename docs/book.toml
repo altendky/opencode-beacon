@@ -1,0 +1,10 @@
+[book]
+title = "opencode-beacon"
+description = "Design and development documentation for opencode-beacon"
+authors = ["opencode-beacon contributors"]
+language = "en"
+src = "src"
+
+[build]
+build-dir = "book"
+create-missing = false

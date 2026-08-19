@@ -1,0 +1,4 @@
+[
+  {"id":"ses_busy","title":"Root session","slug":"root-session"},
+  {"id":"ses_idle","title":"Child session","slug":"child-session","parentID":"ses_busy"}
+]

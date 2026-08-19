@@ -1,0 +1,29 @@
+{
+  extends: ["config:recommended", "helpers:pinGitHubActionDigests"],
+  enabledManagers: ["cargo", "github-actions", "mise", "pre-commit", "regex"],
+  rebaseWhen: "conflicted",
+  customManagers: [
+    {
+      customType: "regex",
+      managerFilePatterns: ["/^rust-toolchain\\.toml$/"],
+      matchStrings: ["channel = \\\"(?<currentValue>[^\\\"]+)\\\""],
+      depNameTemplate: "rust",
+      datasourceTemplate: "docker",
+      packageNameTemplate: "rust",
+    },
+    {
+      customType: "regex",
+      managerFilePatterns: ["/^Cargo\\.toml$/"],
+      matchStrings: ["rust-version = \\\"(?<currentValue>[^\\\"]+)\\\""],
+      depNameTemplate: "rust",
+      datasourceTemplate: "docker",
+      packageNameTemplate: "rust",
+    },
+  ],
+  packageRules: [
+    {
+      matchPackageNames: ["rust"],
+      groupName: "Rust toolchain",
+    },
+  ],
+}

@@ -1,0 +1,3 @@
+[
+  {"id":"per_1","sessionID":"ses_busy","permission":"bash","patterns":["git status"]}
+]

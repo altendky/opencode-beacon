@@ -1,0 +1,264 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: ["**"]
+
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('{0}-{1}', github.workflow_ref, github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  mise:
+    name: Mise
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@7e36c90d9ab29c415a2384db3006f3ec8a8cc654 # v4
+        with:
+          install: false
+      - run: mise install --locked --dry-run
+
+  rust:
+    name: Rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          toolchain: "1.94"
+          components: rustfmt, clippy
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --all-features
+      - run: cargo test --locked --doc --all-features
+
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@7e36c90d9ab29c415a2384db3006f3ec8a8cc654 # v4
+      - run: mise exec -- mdbook build docs
+      - run: mise exec -- mdbook test docs
+
+  security:
+    name: Security
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@7e36c90d9ab29c415a2384db3006f3ec8a8cc654 # v4
+      - run: mise exec -- cargo deny check
+
+  package:
+    name: Package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          toolchain: "1.94"
+      - run: cargo package --locked
+      - name: Test packaged source
+        run: |
+          version="$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[0].version')"
+          package_dir="${RUNNER_TEMP}/opencode-beacon-package"
+          mkdir -p "$package_dir"
+          tar -xzf "target/package/opencode-beacon-${version}.crate" -C "$package_dir"
+          manifest="${package_dir}/opencode-beacon-${version}/Cargo.toml"
+          cargo test --manifest-path "$manifest" --locked --all-features
+          cargo test --manifest-path "$manifest" --locked --doc --all-features
+
+  release-build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            cc_aarch64_unknown_linux_musl: musl-gcc
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          toolchain: "1.94"
+          target: ${{ matrix.target }}
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --locked --release --target ${{ matrix.target }}
+        env:
+          CC_aarch64_unknown_linux_musl: ${{ matrix.cc_aarch64_unknown_linux_musl }}
+      - name: Verify and smoke test
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          binary="target/${TARGET}/release/opencode-beacon"
+          file "$binary" | tee /tmp/file-output
+          grep -Eq 'statically linked|static-pie linked' /tmp/file-output
+          "$binary" --version
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: binary-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/opencode-beacon
+          retention-days: 3
+
+  release-package:
+    name: Release package
+    needs: [release-build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: binary-*
+          path: binaries
+      - name: Package binaries
+        run: |
+          version="$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[0].version')"
+          mkdir -p dist
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            archive="opencode-beacon-${version}-${target}"
+            mkdir -p "dist/${archive}"
+            cp "binaries/binary-${target}/opencode-beacon" "dist/${archive}/"
+            chmod +x "dist/${archive}/opencode-beacon"
+            cp README.md LICENSE-MIT LICENSE-APACHE "dist/${archive}/"
+            tar -czf "dist/${archive}.tar.gz" -C dist "$archive"
+            rm -rf "dist/${archive}"
+          done
+          (cd dist && sha256sum ./*.tar.gz > SHA256SUMS)
+          (cd dist && sha256sum --check SHA256SUMS)
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-assets
+          path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          retention-days: 3
+
+  checks:
+    name: checks
+    if: ${{ !cancelled() }}
+    needs: [mise, rust, docs, security, package, release-package]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: re-actors/alls-green@05ac9388f0aebcb5727afa17fcccfecd6f8ec5fe # release/v1
+        with:
+          jobs: ${{ toJSON(needs) }}
+
+  publish:
+    name: Publish
+    if: github.ref_type == 'tag'
+    needs: [checks, release-package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          toolchain: "1.94"
+      - name: Validate tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[0].version')"
+          test "$TAG" = "v${version}"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: release-assets
+          path: dist
+      - id: crates-auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+      - name: Publish crate
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token }}
+        run: |
+          response="$(mktemp)"
+          trap 'rm -f "$response"' EXIT
+          status="$(curl --silent --show-error --location \
+            --output "$response" \
+            --write-out '%{http_code}' \
+            "https://crates.io/api/v1/crates/opencode-beacon/${VERSION}")"
+          case "$status" in
+            200)
+              echo "opencode-beacon ${VERSION} is already published; continuing release recovery"
+              ;;
+            404)
+              cargo publish --locked
+              ;;
+            *)
+              echo "crates.io lookup failed with HTTP ${status}" >&2
+              cat "$response" >&2
+              exit 1
+              ;;
+          esac
+      - name: Ensure GitHub Release exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          response="$(mktemp)"
+          trap 'rm -f "$response"' EXIT
+          status="$(curl --silent --show-error --location \
+            --output "$response" \
+            --write-out '%{http_code}' \
+            --header 'Accept: application/vnd.github+json' \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}")"
+          case "$status" in
+            200)
+              echo "GitHub Release ${TAG} already exists"
+              ;;
+            404)
+              gh release create "$TAG" --generate-notes --title "$TAG"
+              ;;
+            *)
+              echo "GitHub release lookup failed with HTTP ${status}" >&2
+              cat "$response" >&2
+              exit 1
+              ;;
+          esac
+      - name: Upload GitHub Release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: gh release upload "$TAG" ./dist/*.tar.gz ./dist/SHA256SUMS --clobber
+
+  all:
+    name: all
+    if: ${{ !cancelled() }}
+    needs: [checks, publish]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: re-actors/alls-green@05ac9388f0aebcb5727afa17fcccfecd6f8ec5fe # release/v1
+        with:
+          allowed-skips: publish
+          jobs: ${{ toJSON(needs) }}

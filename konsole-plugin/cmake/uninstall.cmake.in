@@ -1,0 +1,11 @@
+if(NOT EXISTS "@CMAKE_CURRENT_BINARY_DIR@/install_manifest.txt")
+    message(FATAL_ERROR "No install manifest found")
+endif()
+
+file(STRINGS "@CMAKE_CURRENT_BINARY_DIR@/install_manifest.txt" installed_files)
+foreach(installed_file IN LISTS installed_files)
+    if(EXISTS "${installed_file}" OR IS_SYMLINK "${installed_file}")
+        file(REMOVE "${installed_file}")
+        message(STATUS "Removed ${installed_file}")
+    endif()
+endforeach()

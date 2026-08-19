@@ -1,0 +1,8 @@
+{
+    "KPlugin": {
+        "Name": "OpenCode Beacon Activation Bridge",
+        "Description": "Exact Konsole window and session activation for OpenCode Beacon",
+        "Version": "@KONSOLE_RELEASE_VERSION@",
+        "License": "GPL-2.0-or-later"
+    }
+}
