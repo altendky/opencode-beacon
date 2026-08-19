@@ -108,10 +108,11 @@
   return compositor confirmation that activation occurred. A partial status
   means only exact Konsole tab selection succeeded. Focus changes no OpenCode
   route or execution state.
-- Dashboard busy duration begins with Beacon's latest observed non-busy state,
-  not the start of work inside OpenCode. An initially busy root therefore shows
-  `?m`. Disconnect duration is deliberately excluded while state is uncertain,
-  and the compact display saturates at `9999999m`.
+- Dashboard exact busy duration begins with Beacon's latest observed non-busy
+  state, not the start of work inside OpenCode. An initially busy root instead
+  shows how long Beacon has observed it busy as a lower bound (`> Nm`).
+  Disconnect duration is deliberately excluded while state is uncertain, and
+  the compact display saturates at `9999999m`.
 - Dashboard memory accounting requires a readable Linux cgroup-v2 unified
   hierarchy mounted at `/sys/fs/cgroup`, readable procfs starttime/cgroup files,
   and the `memory` controller files. It does not support cgroup v1 or alternate

@@ -22,7 +22,7 @@ const STATE_WIDTH: usize = 22;
 const STATE_COLUMN_WIDTH: u16 = 22;
 const MEMORY_COLUMN_WIDTH: u16 = 9;
 const ATTACHMENT_COLUMN_WIDTH: u16 = 10;
-const ELAPSED_WIDTH: usize = 8;
+const ELAPSED_WIDTH: usize = 10;
 const MAX_ELAPSED_MINUTES: u64 = 9_999_999;
 const MINUTE: Duration = Duration::from_secs(60);
 
@@ -52,10 +52,10 @@ struct DashboardRow {
     question_ids: Vec<String>,
     permission_ids: Vec<String>,
     ready_generation: u64,
-    ready: bool,
     stale: bool,
     attachment_stale: bool,
     last_non_busy: Option<Instant>,
+    first_busy_observed: Option<Instant>,
     frozen_busy_elapsed: Option<Duration>,
     dismissed: Option<Occurrence>,
     category: RowCategory,
@@ -101,9 +101,12 @@ impl DashboardRow {
             Some(Occurrence::Question(self.question_ids.clone()))
         } else if !self.permission_ids.is_empty() {
             Some(Occurrence::Permission(self.permission_ids.clone()))
-        } else if self.busy {
+        } else if self.busy || self.background_count > 0 {
             None
-        } else if self.ready {
+        } else if matches!(
+            self.category,
+            RowCategory::V1 | RowCategory::Attached | RowCategory::Headless
+        ) {
             Some(Occurrence::Ready(self.ready_generation))
         } else {
             None
@@ -148,9 +151,17 @@ impl DashboardRow {
             return None;
         }
         self.frozen_busy_elapsed.or_else(|| {
-            self.last_non_busy
+            self.busy_baseline()
                 .map(|baseline| now.saturating_duration_since(baseline))
         })
+    }
+
+    fn busy_baseline(&self) -> Option<Instant> {
+        self.last_non_busy.or(self.first_busy_observed)
+    }
+
+    const fn busy_elapsed_is_lower_bound(&self) -> bool {
+        self.busy && self.last_non_busy.is_none() && self.first_busy_observed.is_some()
     }
 
     const fn is_stale(&self) -> bool {
@@ -308,6 +319,25 @@ impl DashboardModel {
             .insert(instance.clone(), projection.clone());
 
         if self.v2_instances.contains(&instance) {
+            let aggregates = aggregate_v2_roots(&projection.sessions);
+            let root_ids = aggregates
+                .iter()
+                .map(|aggregate| aggregate.id.as_str())
+                .collect::<HashSet<_>>();
+            self.last_non_busy.retain(|key, _| {
+                key.instance != instance || root_ids.contains(key.root_session_id.as_str())
+            });
+            for aggregate in aggregates {
+                if !aggregate.busy {
+                    self.last_non_busy.insert(
+                        RowKey {
+                            instance: instance.clone(),
+                            root_session_id: aggregate.id,
+                        },
+                        now,
+                    );
+                }
+            }
             self.rebuild_v2_rows(&instance, now);
             return;
         }
@@ -349,6 +379,7 @@ impl DashboardModel {
                     projection.endpoint,
                     &aggregate,
                     self.last_non_busy.get(&key).copied(),
+                    now,
                 ));
             }
         }
@@ -388,8 +419,8 @@ impl DashboardModel {
             row.ready_generation = row.ready_generation.saturating_add(1);
             row.busy = false;
             row.retry = false;
-            row.ready = true;
             row.last_non_busy = Some(now);
+            row.first_busy_observed = None;
             row.frozen_busy_elapsed = None;
             row.dismissed = None;
             return;
@@ -417,10 +448,10 @@ impl DashboardModel {
             question_ids: Vec::new(),
             permission_ids: Vec::new(),
             ready_generation: 1,
-            ready: true,
             stale: false,
             attachment_stale: false,
             last_non_busy: Some(now),
+            first_busy_observed: None,
             frozen_busy_elapsed: None,
             dismissed: None,
             category: RowCategory::V1,
@@ -485,10 +516,11 @@ impl DashboardModel {
                         let mut row = previous.remove(&key).map_or_else(
                             || {
                                 new_row(
-                                    key,
+                                    key.clone(),
                                     projection.endpoint,
                                     aggregate,
-                                    (!aggregate.busy).then_some(now),
+                                    self.last_non_busy.get(&key).copied(),
+                                    now,
                                 )
                             },
                             |mut row| {
@@ -519,10 +551,11 @@ impl DashboardModel {
                 let mut row = previous.remove(&key).map_or_else(
                     || {
                         new_row(
-                            key,
+                            key.clone(),
                             projection.endpoint,
                             &aggregate,
-                            (!aggregate.busy).then_some(now),
+                            self.last_non_busy.get(&key).copied(),
+                            now,
                         )
                     },
                     |mut row| {
@@ -557,10 +590,10 @@ impl DashboardModel {
                 question_ids: Vec::new(),
                 permission_ids: Vec::new(),
                 ready_generation: 0,
-                ready: false,
                 stale: false,
                 attachment_stale: tui.stale,
                 last_non_busy: None,
+                first_busy_observed: None,
                 frozen_busy_elapsed: None,
                 dismissed: None,
                 category: if ambiguous {
@@ -581,10 +614,7 @@ impl DashboardModel {
             .filter(|row| &row.key.instance == instance)
         {
             if stale && !row.stale && row.frozen_busy_elapsed.is_none() {
-                row.frozen_busy_elapsed = row
-                    .last_non_busy
-                    .filter(|_| row.busy)
-                    .map(|baseline| now.saturating_duration_since(baseline));
+                row.frozen_busy_elapsed = row.busy_elapsed(now);
             }
             row.stale = stale;
         }
@@ -954,7 +984,7 @@ impl DashboardModel {
                     && self.connected.contains(&row.key.instance)
             })
             .filter_map(|row| {
-                let baseline = row.last_non_busy?;
+                let baseline = row.busy_baseline()?;
                 let elapsed_minutes = now.saturating_duration_since(baseline).as_secs() / 60;
                 if elapsed_minutes >= MAX_ELAPSED_MINUTES {
                     return None;
@@ -1144,6 +1174,7 @@ fn update_row(
 ) {
     let previous = row.occurrence();
     let was_stale = row.stale;
+    let was_busy = row.busy;
     row.endpoint = endpoint;
     row.title.clone_from(&aggregate.title);
     row.slug.clone_from(&aggregate.slug);
@@ -1154,15 +1185,21 @@ fn update_row(
     row.permission_ids.clone_from(&aggregate.permission_ids);
     if row.busy {
         if (was_stale || row.frozen_busy_elapsed.is_some())
-            && let (Some(_), Some(elapsed)) = (row.last_non_busy, row.frozen_busy_elapsed)
+            && let Some(elapsed) = row.frozen_busy_elapsed
         {
-            row.last_non_busy = now.checked_sub(elapsed);
+            if row.last_non_busy.is_some() {
+                row.last_non_busy = now.checked_sub(elapsed);
+            } else if row.first_busy_observed.is_some() {
+                row.first_busy_observed = now.checked_sub(elapsed);
+            }
+        } else if !was_busy && row.last_non_busy.is_none() {
+            row.first_busy_observed = Some(now);
         }
         row.frozen_busy_elapsed = None;
-        row.ready = false;
         row.dismissed = None;
     } else {
         row.last_non_busy = Some(now);
+        row.first_busy_observed = None;
         row.frozen_busy_elapsed = None;
     }
     if previous != row.occurrence() {
@@ -1175,6 +1212,7 @@ fn new_row(
     endpoint: ServerEndpoint,
     aggregate: &RootAggregate,
     last_non_busy: Option<Instant>,
+    now: Instant,
 ) -> DashboardRow {
     DashboardRow {
         key,
@@ -1187,10 +1225,10 @@ fn new_row(
         question_ids: aggregate.question_ids.clone(),
         permission_ids: aggregate.permission_ids.clone(),
         ready_generation: 0,
-        ready: false,
         stale: false,
         attachment_stale: false,
         last_non_busy,
+        first_busy_observed: (aggregate.busy && last_non_busy.is_none()).then_some(now),
         frozen_busy_elapsed: None,
         dismissed: None,
         category: RowCategory::V1,
@@ -1537,7 +1575,10 @@ fn state_line(
     }
     let stale = row.is_stale().then_some("stale");
     let elapsed = if row.occurrence().is_none() && row.busy {
-        Some(format_elapsed(row.busy_elapsed(now)))
+        Some(format_elapsed(
+            row.busy_elapsed(now),
+            row.busy_elapsed_is_lower_bound(),
+        ))
     } else {
         None
     };
@@ -1576,7 +1617,7 @@ fn state_line(
 fn v2_state_line(row: &DashboardRow, now: Instant) -> Line<'static> {
     let state = if row.busy {
         let foreground = if row.retry { "retry" } else { "busy" };
-        let elapsed = format_elapsed(row.busy_elapsed(now));
+        let elapsed = format_elapsed(row.busy_elapsed(now), row.busy_elapsed_is_lower_bound());
         if row.background_count == 0 {
             format!("{foreground} {}", elapsed.trim())
         } else {
@@ -1586,10 +1627,9 @@ fn v2_state_line(row: &DashboardRow, now: Instant) -> Line<'static> {
                 row.background_count
             )
         }
-    } else if row.background_count > 0 {
-        format!("background {}", row.background_count)
     } else {
-        "idle".to_owned()
+        debug_assert!(row.background_count > 0);
+        format!("background {}", row.background_count)
     };
     let text = if row.is_stale() {
         format!("stale {state}")
@@ -1599,14 +1639,15 @@ fn v2_state_line(row: &DashboardRow, now: Instant) -> Line<'static> {
     Line::styled(text, Style::default().fg(Color::DarkGray))
 }
 
-fn format_elapsed(elapsed: Option<Duration>) -> String {
-    elapsed.map_or_else(
-        || format!("{:>ELAPSED_WIDTH$}", "?m"),
-        |elapsed| {
-            let minutes = (elapsed.as_secs() / 60).min(MAX_ELAPSED_MINUTES);
-            format!("{minutes:>width$}m", width = ELAPSED_WIDTH - 1)
-        },
-    )
+fn format_elapsed(elapsed: Option<Duration>, lower_bound: bool) -> String {
+    let minutes = elapsed
+        .map(|elapsed| (elapsed.as_secs() / 60).min(MAX_ELAPSED_MINUTES))
+        .unwrap_or_default();
+    if lower_bound {
+        format!("{value:>ELAPSED_WIDTH$}", value = format!("> {minutes}m"))
+    } else {
+        format!("{minutes:>width$}m", width = ELAPSED_WIDTH - 1)
+    }
 }
 
 fn occurrence_color(occurrence: &Occurrence) -> Style {
@@ -2455,15 +2496,26 @@ mod tests {
     fn v2_busy_root_without_tui_remains_true_headless_activity() {
         let endpoint = endpoint(4131);
         let instance = managed_key(931, 4131);
+        let start = Instant::now();
         let mut root = session("root", "Root", None, ProjectedStatus::Busy, &[], &[]);
         root.directory = Some(PathBuf::from("/workspace"));
         let mut model = DashboardModel::default();
-        model.apply(found(instance.clone(), endpoint));
-        model.apply(projection(instance, endpoint, vec![root]));
+        model.apply_at(found(instance.clone(), endpoint), start);
+        model.apply_at(projection(instance, endpoint, vec![root]), start);
         assert_eq!(model.rows.len(), 1);
         assert_eq!(model.rows[0].category, RowCategory::Headless);
         assert_eq!(model.rows[0].key.root_session_id, "root");
         assert!(model.rows[0].busy);
+        assert_eq!(
+            state_line(
+                &model.rows[0],
+                model.rows[0].marker(),
+                Style::default(),
+                start + MINUTE,
+            )
+            .to_string(),
+            format!("{:>STATE_WIDTH$}", "> 1m")
+        );
     }
 
     #[test]
@@ -2504,7 +2556,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_state_rendering_covers_idle_foreground_retry_and_background() {
+    fn v2_state_rendering_covers_ready_foreground_retry_and_background() {
         let now = Instant::now();
         let make = |busy, retry, background_count| {
             let mut row = new_row(
@@ -2524,12 +2576,13 @@ mod tests {
                     permission_ids: Vec::new(),
                 },
                 busy.then_some(now),
+                now,
             );
             row.category = RowCategory::Attached;
             row
         };
         for (row, expected) in [
-            (make(false, false, 0), "idle".to_owned()),
+            (make(false, false, 0), "ready".to_owned()),
             (make(true, false, 0), format!("{:>STATE_WIDTH$}", "0m")),
             (make(false, false, 2), "background 2".to_owned()),
             (make(true, false, 2), "busy 0m +2 background".to_owned()),
@@ -2566,6 +2619,7 @@ mod tests {
             endpoint(4150),
             &aggregate,
             Some(now),
+            now,
         );
         row.category = RowCategory::Attached;
         assert_eq!(row.background_count, 1);
@@ -2580,7 +2634,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_child_completion_returns_attached_root_to_idle() {
+    fn v2_child_completion_returns_attached_root_to_ready() {
         let endpoint = endpoint(4160);
         let instance = managed_key(960, 4160);
         let root = session("root", "Root", None, ProjectedStatus::Idle, &[], &[]);
@@ -2633,7 +2687,7 @@ mod tests {
                 now + Duration::from_secs(1)
             )
             .to_string(),
-            "idle"
+            "ready"
         );
     }
 
@@ -2873,7 +2927,7 @@ mod tests {
             ["a", "b"]
         );
         assert_eq!(model.rows[0].title, "A renamed");
-        assert_eq!(model.rows[1].marker(), "");
+        assert_eq!(model.rows[1].marker(), "ready");
     }
 
     #[test]
@@ -3203,6 +3257,7 @@ mod tests {
                 permission_ids: Vec::new(),
             },
             None,
+            Instant::now(),
         );
         assert_eq!(row.marker(), "");
     }
@@ -3291,7 +3346,7 @@ mod tests {
     }
 
     #[test]
-    fn initial_busy_is_unknown_until_a_complete_non_busy_busy_cycle() {
+    fn initial_busy_reports_observed_lower_bound_until_a_non_busy_busy_cycle() {
         let endpoint = endpoint(4016);
         let instance = key(16, 4016);
         let start = Instant::now();
@@ -3315,15 +3370,47 @@ mod tests {
         let buffer = rendered_at(&mut model, 100, 8, start + Duration::from_secs(600));
         let state_x = text_position(&buffer, "STATE").0;
         assert_style(
-            cell_at_text(&buffer, "?m"),
+            cell_at_text(&buffer, "> 10m"),
             Color::DarkGray,
             Modifier::BOLD | Modifier::UNDERLINED,
         );
         assert_eq!(
-            text_position(&buffer, "?m").0,
-            state_x + STATE_COLUMN_WIDTH - 2
+            text_position(&buffer, "> 10m").0,
+            state_x + STATE_COLUMN_WIDTH - 5
         );
-        assert_eq!(model.next_redraw(start), None);
+        assert_eq!(model.next_redraw(start), start.checked_add(MINUTE));
+
+        model.apply_at(
+            BeaconEvent::Disconnected {
+                endpoint,
+                reason: "test".to_owned(),
+            },
+            start + Duration::from_secs(650),
+        );
+        let buffer = rendered_at(&mut model, 100, 8, start + Duration::from_secs(900));
+        assert!(cell_at_text(&buffer, "> 10m").symbol() == ">");
+        assert_eq!(model.next_redraw(start + Duration::from_secs(900)), None);
+        model.apply_at(
+            BeaconEvent::Connected(endpoint),
+            start + Duration::from_secs(900),
+        );
+        model.apply_at(
+            projection(
+                instance.clone(),
+                endpoint,
+                vec![session(
+                    "root",
+                    "Root",
+                    None,
+                    ProjectedStatus::Busy,
+                    &[],
+                    &[],
+                )],
+            ),
+            start + Duration::from_secs(900),
+        );
+        let buffer = rendered_at(&mut model, 100, 8, start + Duration::from_secs(910));
+        assert!(cell_at_text(&buffer, "> 11m").symbol() == ">");
 
         model.apply_at(
             projection(
@@ -3338,7 +3425,7 @@ mod tests {
                     &[],
                 )],
             ),
-            start + Duration::from_secs(700),
+            start + Duration::from_secs(1_000),
         );
         model.apply_at(
             projection(
@@ -3353,9 +3440,9 @@ mod tests {
                     &[],
                 )],
             ),
-            start + Duration::from_secs(710),
+            start + Duration::from_secs(1_010),
         );
-        let buffer = rendered_at(&mut model, 100, 8, start + Duration::from_secs(710));
+        let buffer = rendered_at(&mut model, 100, 8, start + Duration::from_secs(1_010));
         assert!(cell_at_text(&buffer, "0m").symbol() == "0");
     }
 
@@ -3615,15 +3702,19 @@ mod tests {
         );
 
         assert_eq!(
-            format_elapsed(Some(Duration::from_secs(u64::MAX))),
-            "9999999m"
+            format_elapsed(Some(Duration::from_secs(u64::MAX)), false),
+            "  9999999m"
+        );
+        assert_eq!(
+            format_elapsed(Some(Duration::from_secs(u64::MAX)), true),
+            "> 9999999m"
         );
         let saturated = start + Duration::from_secs(MAX_ELAPSED_MINUTES * 60);
         assert_eq!(model.next_redraw(saturated), None);
     }
 
     #[test]
-    fn unknown_busy_counters_are_right_aligned_neutral_and_preserve_selection() {
+    fn lower_bound_busy_counters_are_right_aligned_neutral_and_preserve_selection() {
         let endpoint = endpoint(4023);
         let instance = key(23, 4023);
         let start = Instant::now();
@@ -3656,8 +3747,8 @@ mod tests {
         );
 
         let buffer = rendered_at(&mut model, 100, 8, start + MINUTE);
-        let selected = cell_at_text_on_row(&buffer, "Selected unknown", "?m");
-        let unselected = cell_at_text_on_row(&buffer, "Unselected unknown", "?m");
+        let selected = cell_at_text_on_row(&buffer, "Selected unknown", "> 1m");
+        let unselected = cell_at_text_on_row(&buffer, "Unselected unknown", "> 1m");
         assert_style(
             selected,
             Color::DarkGray,
@@ -3666,15 +3757,15 @@ mod tests {
         assert_style(unselected, Color::DarkGray, Modifier::empty());
         assert_eq!(
             text_position_on_row(&buffer, "Selected unknown", "Selected unknown").0
-                - text_position_on_row(&buffer, "Selected unknown", "?m").0,
-            MEMORY_COLUMN_WIDTH + 4,
-            "selected unknown counter must end before the fixed MEM column"
+                - text_position_on_row(&buffer, "Selected unknown", "> 1m").0,
+            MEMORY_COLUMN_WIDTH + 6,
+            "selected lower-bound counter must end before the fixed MEM column"
         );
         assert_eq!(
             text_position_on_row(&buffer, "Unselected unknown", "Unselected unknown").0
-                - text_position_on_row(&buffer, "Unselected unknown", "?m").0,
-            MEMORY_COLUMN_WIDTH + 4,
-            "unselected unknown counter must end before the fixed MEM column"
+                - text_position_on_row(&buffer, "Unselected unknown", "> 1m").0,
+            MEMORY_COLUMN_WIDTH + 6,
+            "unselected lower-bound counter must end before the fixed MEM column"
         );
     }
 
@@ -3863,6 +3954,34 @@ mod tests {
                 .map(|status| status.message.as_str()),
             Some("question for Root is not dismissed")
         );
+    }
+
+    #[test]
+    fn initially_quiescent_session_is_dismissible_ready_generation_zero() {
+        let endpoint = endpoint(4013);
+        let instance = managed_key(13, 4013);
+        let root = session("root", "Root", None, ProjectedStatus::Idle, &[], &[]);
+        let mut model = DashboardModel::default();
+        model.apply(found(instance.clone(), endpoint));
+        model.apply(projection(instance.clone(), endpoint, vec![root.clone()]));
+        let mut attached = tui(&instance, 14, "/workspace");
+        attached.explicit_session = Some("root".to_owned());
+        model.apply_attachments(
+            AttachmentSnapshot {
+                tuis: vec![attached],
+                v1_focus: HashMap::new(),
+                diagnostic: None,
+            },
+            Instant::now(),
+        );
+
+        assert_eq!(model.rows[0].marker(), "ready");
+        assert_eq!(model.rows[0].ready_generation, 0);
+        model.handle_terminal_event(&key_event(KeyCode::Right), 5);
+        assert!(model.rows[0].dismissed());
+
+        model.apply(projection(instance, endpoint, vec![root]));
+        assert!(model.rows[0].dismissed());
     }
 
     #[test]

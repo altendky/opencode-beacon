@@ -69,7 +69,9 @@ dashboard; no shared Beacon event claims protocol-authoritative TUI route state.
 Duplicate IDs from different servers remain distinct and gain endpoint context
 only when needed. Disconnected or retained uncertain rows are marked stale.
 
-For v2, `STATE` keeps foreground and background work distinct. A root executing
+For v2, `STATE` keeps availability, foreground, and background work distinct. A
+fully quiescent known root shows dismissible `ready`, including when first
+observed. A root executing
 without active descendants uses the same right-aligned elapsed-only display as
 other rows; every busy/retrying descendant at any
 known `parentID` depth contributes to a separate count. An idle prompt-available
@@ -80,11 +82,14 @@ root remains visible as `headless` when no TUI resolves to it.
 
 For v1, the fixed-width `STATE` column retains its existing right-aligned whole
 minutes (`0m`, `1m`, ...) while a root is busy/retrying. V2 foreground work uses
-the same elapsed-only display and baseline. A root first observed busy shows `?m` until Beacon
-observes it non-busy and a later busy/retry cycle begins. Disconnected counters
-freeze and exclude disconnected time. Values saturate at `9999999m`.
-Question and permission from any known child remain attributed to the root and,
-along with ready, retain priority over execution text.
+the same elapsed-only display and baseline. A root first observed busy reports the
+time Beacon has observed it busy as a lower bound (`> 0m`, `> 1m`, ...). After
+Beacon observes it non-busy, later busy/retry cycles show exact elapsed minutes.
+Disconnected counters freeze and exclude disconnected time. Values saturate at
+`9999999m`.
+Question and permission from any known child remain attributed to the root and
+retain priority over execution text. Ready appears only when the known root and
+all known descendants are quiescent.
 
 Dashboard also samples Linux cgroup-v2 memory every 10 seconds. For procfs-discovered
 v1 and standalone v2 instances, the fixed
@@ -109,7 +114,9 @@ never mutate an OpenCode session. Active attention is
 left-aligned in `STATE`; dismissed attention keeps its semantic color, becomes
 dim, and moves to the right edge. Actions produce immediate success or no-op
 feedback in the status line. Dismissal and feedback clear on changed request
-membership/kind, busy state, or a fresh ready cycle. Question is blue, permission is light
+membership/kind, busy or background state, or a fresh ready cycle. Dashboard
+`ready` means the known session is fully quiescent; the raw and watch feeds retain
+transition-based ready semantics. Question is blue, permission is light
 yellow/amber, and ready is green. Busy duration is pale neutral text, never an
 attention hue. A fixed `>` column marks selection; selected text is
 bold and underlined without a selection background, reverse video, or foreground

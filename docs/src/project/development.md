@@ -59,7 +59,8 @@ grouped title/session ordering, metadata-driven reorder, stable unrelated update
 selection preservation/scroll, aggregation, exact foreground/background/modifier
 styles, Right dismissal/Left restoration and feedback, unbound legacy keys,
 dismissal occurrences, left/right attention alignment without a checkmark,
-monotonic busy elapsed boundaries, neutral `?m`, stale freezing, fixed-column alignment, saturation, and
+monotonic exact and lower-bound busy elapsed boundaries, stale freezing,
+fixed-column alignment, saturation, and
 one-shot timer deadline/no-idle-wakeup behavior.
 Synthetic cgroup tests cover proc stat, unified cgroup and memory.stat parsing,
 canonical path escape rejection, device/inode deduplication, PID starttime
@@ -76,7 +77,8 @@ Synthetic standalone tests cover exact stdio classification, private credential
 recovery, authenticated health PID identity, v2 dashboard admission, and direct
 cgroup memory classification.
 V1 dashboard admission remains a dedicated-endpoint regression case.
-V2 root-state tests independently cover idle foreground, root busy/retry,
+V2 root-state tests independently cover initially quiescent dismissible ready,
+root busy/retry,
 background-only, foreground plus background count, nested descendants, child
 completion, child retry/attention priority, headless background roots, and
 unresolved attachment rows without invented activity.

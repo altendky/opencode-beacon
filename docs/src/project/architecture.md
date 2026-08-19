@@ -89,7 +89,8 @@ metadata-only changes, authoritative removals/resolutions, and replacement.
 
 Dashboard is one foreground sink over the same bounded stream. Its pure model
 maintains instance-scoped stable rows, locally dismissible and restorable
-attention occurrences, selection, and scrolling. Rows have stable admission
+attention occurrences, including dashboard-local ready for every fully
+quiescent known session, plus selection and scrolling. Rows have stable admission
 groups and canonical displayed-title/session ordering within each group; model
 updates restore selection by row identity after any required reorder. V1 retains its dedicated
 endpoint working-set behavior. For v2, high-confidence attached roots,
@@ -104,7 +105,8 @@ explicit evidence clear the pair. V2 aggregation preserves the root's own
 foreground status and separately counts every busy/retrying descendant from
 `parentID` ancestry, including nested descendants. Attachment category never
 changes execution state. It also retains per-root monotonic
-last-observed-non-busy instants.
+last-observed-non-busy instants and first-observed-busy instants when no exact
+baseline is available.
 Busy elapsed rendering and the next exact elapsed-minute redraw deadline receive
 an explicit `Instant`, keeping tests independent of wall time. A one-shot Tokio
 sleep is armed only when at least one connected, unmasked, known counter can

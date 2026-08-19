@@ -205,8 +205,9 @@ The `ATTACH` classification must remain orthogonal to execution state. For each
 displayed v2 root, foreground status comes only from that root session's own
 projected status. Background count is the number of distinct known descendants,
 at any ancestry depth, whose own status is busy or retry. An idle root with no
-active descendants renders `idle`; an idle root with active descendants renders
-`background N`; a busy or retrying root without active descendants renders only
+active descendants renders dismissible `ready`, including when first observed;
+an idle root with active descendants renders `background N`; a busy or retrying
+root without active descendants renders only
 its right-aligned elapsed time, while a root with descendants renders foreground
 state and elapsed plus `+N background`. A root with only
 background activity remains visible as headless when no TUI resolves to it.
@@ -214,22 +215,27 @@ Unresolved and ambiguous TUI rows must not invent session execution state.
 
 Question and permission membership from any known descendant retains the
 existing root attribution and priority over foreground/background rendering.
-Ready retains its existing priority when present. Descendant retry contributes
-to background count and must not turn an idle root into foreground retry.
+Dashboard ready is the fallback for every fully quiescent known session.
+Descendant retry contributes to background count and must not turn an idle root
+into foreground retry.
 
-V1 retains question, permission, blank busy/retry, then ready priority. For both
+V1 retains question, permission, blank busy/retry, then ready priority. Every
+admitted, fully quiescent known session renders `ready`, independently of whether
+the monitor emitted transition-based ready attention. For both
 versions, only the attention word is colored blue, light-yellow/amber, or green respectively,
 and selection preserves it. Selection uses a fixed `>` column plus text emphasis,
 without setting a background, reversing video, or overriding foreground colors.
 
 Dashboard dismissal is local and non-mutating. It dims only the selected current
-kind plus request-ID set or ready generation. Right dismisses that occurrence and
+kind plus request-ID set or dashboard ready generation. Generation zero
+represents initially observed quiescence; monitor ready events advance the
+generation. Right dismisses that occurrence and
 Left restores it; `d` is unbound. Success and no-op attempts immediately report
 status. No-attention actions are no-ops. Active attention is
 left-aligned in the fixed STATE field; dismissed attention is right-aligned and
 dimmed in the same semantic hue, without a checkmark or background. The
-occurrence-bound dismissal and status clear on kind/membership change, busy,
-fresh ready, restart, or replacement.
+occurrence-bound dismissal and status clear on kind/membership change, busy or
+background activity, fresh ready, restart, or replacement.
 
 Dashboard attachment sampling may additionally read at most 256 KiB from an
 otherwise eligible stable TUI process environment. It must discard every entry
@@ -267,8 +273,10 @@ attention marker is absent, Dashboard must render right-aligned whole elapsed
 minutes in a stable fixed-width state area. Elapsed time uses monotonic `Instant`
 from the latest observation of that root as non-busy, including pre-admission
 observations and ready admission. Initial busy admission without such an
-observation displays neutral `?m`; any later non-busy observation establishes the
-baseline for a future busy/retry cycle. Question, permission, and ready markers,
+observation starts a first-observed-busy baseline and displays the elapsed whole
+minutes as a neutral lower bound (`> 0m`, `> 1m`, ...); any later non-busy
+observation establishes the exact baseline for a future busy/retry cycle.
+Question, permission, and ready markers,
 including dismissed attention, replace elapsed text. Elapsed text uses DarkGray or
 an equivalent low-contrast neutral foreground, never an attention hue or
 background, and selection may add emphasis without replacing that foreground.
@@ -303,7 +311,7 @@ stale label but does not advance that frozen duration; the next authoritative
 projection either resumes busy timing without including disconnected time or
 resets the baseline from an observed non-busy state. Dashboard schedules one-shot
 redraws at exact next elapsed-minute boundaries only while a connected, visible,
-known, unsaturated counter can change. Unknown, masked, stale, non-busy, and
+known, unsaturated counter can change. Masked, stale, non-busy, and
 fully saturated rows must not independently cause timer wakeups.
 
 Watch columns are `TIME` at 20 ASCII cells, `SESSION` at a minimum 30, `REASON`
