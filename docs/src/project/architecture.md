@@ -59,6 +59,9 @@ ancestry rather than guessing.
 
 Each server task opens SSE before its bootstrap snapshot and buffers events
 while the snapshot is fetched.
+The server task is the sole SSE owner for its discovered instance. Raw, watch,
+dashboard, and all session rows receive locally reduced events from the shared
+bounded monitor channel and never subscribe independently.
 At the 1,024-event bootstrap capacity, the task stops polling the SSE body and
 awaits the in-flight snapshot.
 The same pause occurs at a fixed 8 MiB exact source-frame-byte budget; one frame
@@ -195,6 +198,8 @@ Receiver closure cancels the monitor tree.
 while `wait()` borrows and awaits its optional join handle, clearing it only
 after completion.
 Per-server shutdown follows the same cancellation-safe ownership rule.
+CLI shutdown is bounded: after cooperative cancellation, non-settling owned work
+is aborted, while dashboard terminal restoration is attempted before waiting.
 
 Procfs traversal remains owned by the discovery future and cooperatively yields
 between processes and bounded file-descriptor batches.

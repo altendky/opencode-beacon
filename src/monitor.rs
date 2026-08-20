@@ -278,6 +278,28 @@ impl MonitorRuntime {
         self.join.take();
         result
     }
+
+    /// Requests shutdown and waits up to `grace` before aborting owned work.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the monitor task panicked. Cancellation caused by the
+    /// bounded-shutdown escalation is treated as successful cleanup.
+    pub async fn shutdown(&mut self, grace: Duration) -> Result<(), tokio::task::JoinError> {
+        self.control.shutdown();
+        if let Ok(result) = tokio::time::timeout(grace, self.wait()).await {
+            return result;
+        }
+
+        let Some(join) = self.join.take() else {
+            return Ok(());
+        };
+        join.abort();
+        match join.await {
+            Err(error) if error.is_cancelled() => Ok(()),
+            result => result,
+        }
+    }
 }
 
 impl Drop for MonitorRuntime {
@@ -1063,10 +1085,9 @@ async fn wait_to_reconnect(
     let delay = tokio::time::sleep(reconnect_delay(attempt));
     tokio::pin!(delay);
     let mut delay_elapsed = false;
-    let mut verified = false;
     loop {
         let current = verification.borrow_and_update().clone();
-        verified |= current.key.as_ref() == Some(expected_key)
+        let verified = current.key.as_ref() == Some(expected_key)
             && current.generation > disconnect_generation;
         if verified && delay_elapsed {
             return true;
@@ -1075,7 +1096,7 @@ async fn wait_to_reconnect(
             () = shutdown.cancelled() => return false,
             () = cancellation.cancelled() => return false,
             () = &mut delay, if !delay_elapsed => delay_elapsed = true,
-            changed = verification.changed(), if !verified => {
+            changed = verification.changed() => {
                 if changed.is_err() {
                     return false;
                 }
@@ -3832,6 +3853,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconnect_requires_latest_completion_to_still_verify_instance() {
+        let expected_key = instance_key(2);
+        let (verification, mut verification_rx) = watch::channel(DiscoveryCompletion {
+            generation: 4,
+            key: None,
+        });
+        let shutdown = CancellationToken::new();
+        let cancellation = shutdown.child_token();
+        let waiter_shutdown = shutdown.clone();
+        let waiter_cancellation = cancellation.clone();
+        let waiter_key = expected_key.clone();
+        let waiter = tokio::spawn(async move {
+            wait_to_reconnect(
+                &waiter_key,
+                4,
+                &mut verification_rx,
+                &waiter_shutdown,
+                &waiter_cancellation,
+                0,
+            )
+            .await
+        });
+
+        verification.send_replace(DiscoveryCompletion {
+            generation: 5,
+            key: Some(expected_key.clone()),
+        });
+        verification.send_replace(DiscoveryCompletion {
+            generation: 6,
+            key: None,
+        });
+        tokio::time::sleep(Duration::from_millis(1_300)).await;
+        assert!(!waiter.is_finished());
+
+        verification.send_replace(DiscoveryCompletion {
+            generation: 7,
+            key: Some(expected_key),
+        });
+        assert!(waiter.await.is_ok_and(|allowed| allowed));
+    }
+
+    #[tokio::test]
     async fn reconnect_rejects_verification_closure_and_cancellation() {
         let (verification, mut verification_rx) = watch::channel(DiscoveryCompletion {
             generation: 0,
@@ -4238,6 +4301,31 @@ mod tests {
         );
         assert!(release.send(()).is_ok());
         assert!(runtime.wait().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn bounded_runtime_shutdown_aborts_non_cooperative_owned_work() {
+        let (_events_tx, events) = mpsc::channel(1);
+        let (resync, _resync_rx) = watch::channel(0_u64);
+        let (discovery, _discovery_rx) = watch::channel(0_u64);
+        let shutdown = CancellationToken::new();
+        let join = tokio::spawn(pending::<()>());
+        let abort = join.abort_handle();
+        let mut runtime = MonitorRuntime {
+            events,
+            control: MonitorControl {
+                shutdown: shutdown.clone(),
+                resync,
+                discovery,
+            },
+            join: Some(join),
+        };
+
+        assert!(runtime.shutdown(Duration::from_millis(10)).await.is_ok());
+        assert!(shutdown.is_cancelled());
+        assert!(abort.is_finished());
+        assert!(runtime.join.is_none());
+        assert!(runtime.shutdown(Duration::ZERO).await.is_ok());
     }
 
     #[tokio::test]

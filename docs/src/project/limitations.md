@@ -28,6 +28,16 @@
   network options. Managed v2 uses a different client-socket heuristic.
 - Discovery does not cross users, network namespaces, or machines.
 - OpenCode provides no stable server ID or SSE replay cursor.
+- Beacon has no generated OpenCode SDK and does not support `/global/event`.
+  Its Rust reqwest stream is cancelled by dropping the unfinished response body,
+  rather than by a JavaScript `AbortController`. Distinct discovered endpoints
+  remain distinct `InstanceKey` values even if one PID owns more than one
+  listener; Beacon shares one stream per active discovered instance, not one
+  stream per PID across different endpoints.
+- OpenCode 1.17.4/Bun has a confirmed server-side cleanup bug around repeated
+  real-TUI `/event` disconnects. Beacon closes its client transport, but cannot
+  repair server-side resources that Bun/OpenCode retains; acceptance therefore
+  avoids repeatedly cycling existing real TUI streams.
 - HTTP snapshot endpoints are complete as a group but not server-transactional.
 - An interruption can collapse several missed changes into one reconciled
   transition.
@@ -176,7 +186,9 @@
   managed attachment rows display `N/A` rather than misattribute the shared
   service process. Standalone v2 remains eligible for direct procfs accounting.
 - RAII restores raw/alternate-screen/cursor/mouse state on catchable paths.
-  `SIGKILL`, power loss, terminal failure, or process abort cannot run cleanup.
+  SIGINT and SIGTERM request bounded graceful cleanup. `SIGKILL`, power loss,
+  terminal failure, process abort, or a crash cannot run cleanup. Network loss
+  can remain half-open until the operating system and TCP stack detect it.
 - There are no notifications, persisted acknowledgements, OpenCode session controls,
   port scans, remote endpoints, GUI, web UI, or `/global/event` support.
 

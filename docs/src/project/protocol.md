@@ -78,3 +78,36 @@ so a later LF is consumed as a leading empty record and frame-byte accounting is
 independent of network chunk boundaries.
 If bootstrap SSE then fails or ends, valid journaled records are observed and
 reduced FIFO before disconnect output.
+
+## SSE connection lifecycle
+
+Beacon does not use an OpenCode generated SDK, browser `EventSource`, or
+`AbortController`. The only subscriptions in the repository are the v1
+`/event` request and the v2 `/api/event` request above; `/global/event` is not
+supported. Each discovered `InstanceKey` owns one server task and that task owns
+at most one established response body. Sessions, snapshots, raw output, watch,
+and dashboard consume or filter the resulting local bounded event stream; they
+do not open SSE subscriptions.
+
+Opening response headers, bootstrap, live reads, reconciliation, reconnect
+delay, receiver closure, replacement, and shutdown all select against the
+server/root cancellation tokens. Returning from any branch drops the pinned
+reqwest body stream. Dropping that stream is reqwest's cancellation mechanism;
+it drops the response body and closes an established, unfinished SSE transport.
+A local TCP integration test verifies that the peer observes EOF. There is no
+separate async iterator task to cancel or await.
+
+Reconnect is serialized in the same server task: the old connection scope has
+returned and its stream and timers have been dropped before a new request can
+start. Both bounded exponential backoff and a strictly newer discovery
+completion are required, and the latest completion must still verify the exact
+instance when the delay expires. This latest-value rule prevents a verification
+followed by removal from authorizing a stale reconnect. Replacement similarly
+cancels and awaits the old server task before starting its successor.
+
+Monitor control cancellation is idempotent. CLI SIGINT and SIGTERM receivers are
+installed once before mode-specific work (and before dashboard terminal mode),
+then request cooperative shutdown. The CLI waits for owned work for a bounded
+grace period and aborts it if it does not settle; dashboard terminal restoration
+is attempted before that wait. Rust has no React mount/effect or Node
+`EventEmitter` listener-limit mechanism here, so no listener limit is altered.

@@ -37,6 +37,7 @@ use focus::{FocusResult, focus_client};
 use memory::CgroupMemorySampler;
 
 const MEMORY_SAMPLE_INTERVAL: Duration = Duration::from_secs(10);
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Monitor local coding-agent activity")]
@@ -117,20 +118,38 @@ async fn main() -> Result<(), Box<dyn Error>> {
         auth,
     };
     let monitor = Monitor::new(monitor_config(&args, client.clone()))?;
+    let mut signals = ShutdownSignals::new()?;
     if args.once {
-        return run_once(&args, &client).await;
+        return run_once(&args, &client, &mut signals).await;
     }
     if let Some(Command::Watch(watch)) = args.command {
-        return run_watch(&args, monitor, watch).await;
+        return run_watch(&args, monitor, watch, &mut signals).await;
     }
     if matches!(args.command, Some(Command::Dashboard)) {
-        return run_dashboard(monitor).await;
+        return run_dashboard(monitor, &mut signals).await;
     }
-    run_raw(&args, monitor).await
+    run_raw(&args, monitor, &mut signals).await
+}
+
+struct ShutdownSignals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+    resync: tokio::signal::unix::Signal,
+}
+
+impl ShutdownSignals {
+    fn new() -> io::Result<Self> {
+        Ok(Self {
+            interrupt: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?,
+            terminate: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
+            resync: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?,
+        })
+    }
 }
 
 struct TerminalGuard {
-    active: bool,
+    screen_active: bool,
+    raw_active: bool,
 }
 
 trait TerminalCleanup {
@@ -155,30 +174,53 @@ impl TerminalCleanup for CrosstermCleanup {
     }
 }
 
+#[cfg(test)]
 fn restore_terminal(cleanup: &mut impl TerminalCleanup) -> io::Result<()> {
     let terminal_result = cleanup.leave_screen();
     let raw_result = cleanup.leave_raw_mode();
     terminal_result.and(raw_result)
 }
 
+fn restore_terminal_state(
+    cleanup: &mut impl TerminalCleanup,
+    screen_active: &mut bool,
+    raw_active: &mut bool,
+) -> io::Result<()> {
+    let screen_result = if *screen_active {
+        cleanup.leave_screen().inspect(|()| *screen_active = false)
+    } else {
+        Ok(())
+    };
+    let raw_result = if *raw_active {
+        cleanup.leave_raw_mode().inspect(|()| *raw_active = false)
+    } else {
+        Ok(())
+    };
+    screen_result.and(raw_result)
+}
+
 impl TerminalGuard {
     fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
-        let mut guard = Self { active: true };
+        let mut guard = Self {
+            screen_active: false,
+            raw_active: true,
+        };
         let mut stdout = io::stdout();
         if let Err(error) = execute!(stdout, EnterAlternateScreen, Hide, EnableMouseCapture) {
             let _ = guard.restore();
             return Err(error);
         }
+        guard.screen_active = true;
         Ok(guard)
     }
 
     fn restore(&mut self) -> io::Result<()> {
-        if !self.active {
-            return Ok(());
-        }
-        self.active = false;
-        restore_terminal(&mut CrosstermCleanup)
+        restore_terminal_state(
+            &mut CrosstermCleanup,
+            &mut self.screen_active,
+            &mut self.raw_active,
+        )
     }
 }
 
@@ -208,7 +250,10 @@ fn validate_dashboard_terminal(
 }
 
 #[allow(clippy::too_many_lines)]
-async fn run_dashboard(monitor: Monitor) -> Result<(), Box<dyn Error>> {
+async fn run_dashboard(
+    monitor: Monitor,
+    signals: &mut ShutdownSignals,
+) -> Result<(), Box<dyn Error>> {
     validate_dashboard_terminal(
         io::stdin().is_terminal(),
         io::stdout().is_terminal(),
@@ -224,11 +269,16 @@ async fn run_dashboard(monitor: Monitor) -> Result<(), Box<dyn Error>> {
     let mut next_memory_sample = Instant::now();
     let mut runtime = monitor.spawn();
     let control = runtime.control.clone();
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let mut resync = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
     let mut result = Ok(());
 
-    terminal.draw(|frame| model.render_at(frame, Instant::now()))?;
+    if let Err(error) = terminal.draw(|frame| model.render_at(frame, Instant::now())) {
+        control.shutdown();
+        let terminal_result = guard.restore();
+        let shutdown_result = runtime.shutdown(SHUTDOWN_GRACE).await;
+        shutdown_result?;
+        terminal_result?;
+        return Err(error.into());
+    }
     loop {
         let redraw_deadline = model.next_redraw(Instant::now());
         let redraw_timer = async {
@@ -239,18 +289,15 @@ async fn run_dashboard(monitor: Monitor) -> Result<(), Box<dyn Error>> {
         };
         let memory_timer = tokio::time::sleep_until(next_memory_sample.into());
         tokio::select! {
-            signal = tokio::signal::ctrl_c() => {
-                if let Err(error) = signal {
-                    result = Err(error);
-                }
+            _ = signals.interrupt.recv() => {
                 control.shutdown();
                 break;
             }
-            _ = terminate.recv() => {
+            _ = signals.terminate.recv() => {
                 control.shutdown();
                 break;
             }
-            _ = resync.recv() => control.request_resync(),
+            _ = signals.resync.recv() => control.request_resync(),
             terminal_event = events.next() => {
                 let Some(terminal_event) = terminal_event else {
                     control.shutdown();
@@ -272,10 +319,18 @@ async fn run_dashboard(monitor: Monitor) -> Result<(), Box<dyn Error>> {
                                 }
                             }
                             DashboardAction::Focus(request) => {
-                                let message = focus_result_message(
-                                    &request.name,
-                                    focus_client(&request.target).await,
-                                );
+                                let focus = focus_client(&request.target);
+                                tokio::pin!(focus);
+                                let focus_result = tokio::select! {
+                                    _ = signals.interrupt.recv() => None,
+                                    _ = signals.terminate.recv() => None,
+                                    result = &mut focus => Some(result),
+                                };
+                                let Some(focus_result) = focus_result else {
+                                    control.shutdown();
+                                    break;
+                                };
+                                let message = focus_result_message(&request.name, focus_result);
                                 model.report_focus_result(&message);
                                 if let Err(error) = terminal.draw(|frame| model.render_at(frame, Instant::now())) {
                                     result = Err(error);
@@ -325,8 +380,10 @@ async fn run_dashboard(monitor: Monitor) -> Result<(), Box<dyn Error>> {
         }
     }
 
-    runtime.wait().await?;
-    guard.restore()?;
+    let terminal_result = guard.restore();
+    let shutdown_result = runtime.shutdown(SHUTDOWN_GRACE).await;
+    shutdown_result?;
+    terminal_result?;
     result.map_err(Into::into)
 }
 
@@ -344,24 +401,25 @@ fn focus_result_message(name: &str, result: FocusResult) -> String {
     }
 }
 
-async fn run_raw(args: &Args, monitor: Monitor) -> Result<(), Box<dyn Error>> {
+async fn run_raw(
+    args: &Args,
+    monitor: Monitor,
+    signals: &mut ShutdownSignals,
+) -> Result<(), Box<dyn Error>> {
     let mut runtime = monitor.spawn();
     let control = runtime.control.clone();
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let mut resync = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
 
     loop {
         tokio::select! {
-            signal = tokio::signal::ctrl_c() => {
-                signal?;
+            _ = signals.interrupt.recv() => {
                 control.shutdown();
                 break;
             }
-            _ = terminate.recv() => {
+            _ = signals.terminate.recv() => {
                 control.shutdown();
                 break;
             }
-            _ = resync.recv() => control.request_resync(),
+            _ = signals.resync.recv() => control.request_resync(),
             event = runtime.events.recv() => {
                 let Some(event) = event else { break };
                 print_event(event, args.verbose > 0);
@@ -369,14 +427,16 @@ async fn run_raw(args: &Args, monitor: Monitor) -> Result<(), Box<dyn Error>> {
         }
     }
 
-    while let Some(event) = runtime.events.recv().await {
-        print_event(event, args.verbose > 0);
-    }
-    runtime.wait().await?;
+    runtime.shutdown(SHUTDOWN_GRACE).await?;
     Ok(())
 }
 
-async fn run_watch(args: &Args, monitor: Monitor, watch: WatchArgs) -> Result<(), Box<dyn Error>> {
+async fn run_watch(
+    args: &Args,
+    monitor: Monitor,
+    watch: WatchArgs,
+    signals: &mut ShutdownSignals,
+) -> Result<(), Box<dyn Error>> {
     let mut stdout = io::stdout();
     let mut stderr = io::stderr();
     if let Err(error) = write_watch_header(&mut stdout, watch.header) {
@@ -389,22 +449,19 @@ async fn run_watch(args: &Args, monitor: Monitor, watch: WatchArgs) -> Result<()
 
     let mut runtime = monitor.spawn();
     let control = runtime.control.clone();
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let mut resync = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
     let mut write_error = None;
 
     loop {
         tokio::select! {
-            signal = tokio::signal::ctrl_c() => {
-                signal?;
+            _ = signals.interrupt.recv() => {
                 control.shutdown();
                 break;
             }
-            _ = terminate.recv() => {
+            _ = signals.terminate.recv() => {
                 control.shutdown();
                 break;
             }
-            _ = resync.recv() => control.request_resync(),
+            _ = signals.resync.recv() => control.request_resync(),
             event = runtime.events.recv() => {
                 let Some(event) = event else { break };
                 if let Err(error) = write_watch_event(
@@ -424,7 +481,7 @@ async fn run_watch(args: &Args, monitor: Monitor, watch: WatchArgs) -> Result<()
         }
     }
 
-    runtime.wait().await?;
+    runtime.shutdown(SHUTDOWN_GRACE).await?;
     if let Some(error) = write_error {
         return Err(error.into());
     }
@@ -580,7 +637,19 @@ fn monitor_config(args: &Args, client: ClientConfig) -> MonitorConfig {
     }
 }
 
-async fn run_once(args: &Args, client_config: &ClientConfig) -> Result<(), Box<dyn Error>> {
+async fn run_once(
+    args: &Args,
+    client_config: &ClientConfig,
+    signals: &mut ShutdownSignals,
+) -> Result<(), Box<dyn Error>> {
+    tokio::select! {
+        _ = signals.interrupt.recv() => Ok(()),
+        _ = signals.terminate.recv() => Ok(()),
+        result = run_once_inner(args, client_config) => result,
+    }
+}
+
+async fn run_once_inner(args: &Args, client_config: &ClientConfig) -> Result<(), Box<dyn Error>> {
     if args.claude_enabled() {
         print_once_claude(args.verbose > 0);
     }
@@ -1226,6 +1295,45 @@ mod tests {
         };
         assert!(restore_terminal(&mut cleanup).is_err());
         assert_eq!(cleanup.calls, ["screen", "raw"]);
+    }
+
+    #[test]
+    fn terminal_cleanup_is_idempotent_and_retries_only_failed_steps() {
+        struct Cleanup {
+            calls: Vec<&'static str>,
+            first_screen_fails: bool,
+        }
+
+        impl TerminalCleanup for Cleanup {
+            fn leave_screen(&mut self) -> io::Result<()> {
+                self.calls.push("screen");
+                if std::mem::take(&mut self.first_screen_fails) {
+                    Err(io::Error::other("screen"))
+                } else {
+                    Ok(())
+                }
+            }
+
+            fn leave_raw_mode(&mut self) -> io::Result<()> {
+                self.calls.push("raw");
+                Ok(())
+            }
+        }
+
+        let mut cleanup = Cleanup {
+            calls: Vec::new(),
+            first_screen_fails: true,
+        };
+        let mut screen_active = true;
+        let mut raw_active = true;
+        assert!(restore_terminal_state(&mut cleanup, &mut screen_active, &mut raw_active).is_err());
+        assert!(screen_active);
+        assert!(!raw_active);
+        assert!(restore_terminal_state(&mut cleanup, &mut screen_active, &mut raw_active).is_ok());
+        assert!(!screen_active);
+        assert!(!raw_active);
+        assert!(restore_terminal_state(&mut cleanup, &mut screen_active, &mut raw_active).is_ok());
+        assert_eq!(cleanup.calls, ["screen", "raw", "screen"]);
     }
 
     #[test]

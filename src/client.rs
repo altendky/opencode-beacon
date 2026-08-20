@@ -1277,6 +1277,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repeated_event_stream_drops_close_every_peer_connection() {
+        const CYCLES: usize = 3;
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|error| unreachable!("bind succeeded: {error}"));
+        let address = listener
+            .local_addr()
+            .unwrap_or_else(|error| unreachable!("address exists: {error}"));
+        let server = tokio::spawn(async move {
+            for _ in 0..CYCLES {
+                let (mut socket, _) = listener
+                    .accept()
+                    .await
+                    .unwrap_or_else(|error| unreachable!("accept succeeded: {error}"));
+                let mut request = [0_u8; 1024];
+                assert!(socket.read(&mut request).await.is_ok());
+                assert!(
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+                        )
+                        .await
+                        .is_ok()
+                );
+                let mut byte = [0_u8; 1];
+                if !tokio::time::timeout(Duration::from_secs(1), socket.read(&mut byte))
+                    .await
+                    .is_ok_and(|result| result.is_ok_and(|read| read == 0))
+                {
+                    return false;
+                }
+            }
+            true
+        });
+        let endpoint =
+            ServerEndpoint::new(address).unwrap_or_else(|error| unreachable!("loopback: {error}"));
+        let client = OpenCodeClient::new(endpoint, ClientConfig::default())
+            .unwrap_or_else(|error| unreachable!("client builds: {error}"));
+
+        for _ in 0..CYCLES {
+            let stream = client
+                .event_stream()
+                .await
+                .unwrap_or_else(|error| unreachable!("stream opens: {error}"));
+            drop(stream);
+        }
+
+        assert!(server.await.is_ok_and(|closed| closed));
+    }
+
+    #[tokio::test]
     async fn event_stream_requires_ok_sse_content_type_before_opening() {
         for (status, content_type, expected) in [
             ("204 No Content", None, "OpenCode returned 204"),
