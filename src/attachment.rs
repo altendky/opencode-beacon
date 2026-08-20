@@ -5,8 +5,8 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::path::{Component, Path, PathBuf};
 
 use opencode_beacon::model::{
     BeaconEvent, InstanceKey, InstanceSource, OpenCodeProtocol, ServerEndpoint,
@@ -14,6 +14,10 @@ use opencode_beacon::model::{
 
 const MAX_PROCESS_ENVIRONMENT_SIZE: u64 = 256 * 1024;
 const MAX_KONSOLE_IDENTIFIER_SIZE: usize = 128;
+const MAX_KITTY_PID_SIZE: usize = 10;
+const MAX_KITTY_WINDOW_ID_SIZE: usize = 20;
+const MAX_KITTY_SOCKET_PATH_SIZE: usize = 107;
+const MAX_KITTY_LISTEN_ON_SIZE: usize = "unix:".len() + MAX_KITTY_SOCKET_PATH_SIZE;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct TuiKey {
@@ -29,9 +33,24 @@ pub struct KonsoleTarget {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KittyTarget {
+    pub process: TuiKey,
+    pub window_id: u64,
+    pub socket_path: PathBuf,
+    pub socket_device: u64,
+    pub socket_inode: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ClientFocusTarget {
+    Konsole(KonsoleTarget),
+    Kitty(KittyTarget),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FocusTarget {
     pub process: TuiKey,
-    pub konsole: KonsoleTarget,
+    pub client: ClientFocusTarget,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -314,10 +333,7 @@ fn scan(
             pid,
             start_time: before.start_time,
         };
-        let focus = read_konsole_target(&process).map(|konsole| FocusTarget {
-            process: key,
-            konsole,
-        });
+        let focus = read_focus_target(proc_root, &process, key);
         tuis.insert(
             key,
             LikelyTui {
@@ -371,7 +387,14 @@ fn scan_v1_focus(
             {
                 return None;
             }
-            let konsole = read_konsole_target(&process)?;
+            let focus = read_focus_target(
+                proc_root,
+                &process,
+                TuiKey {
+                    pid: target.pid,
+                    start_time: before.start_time,
+                },
+            )?;
             if read_process_stat(&process).ok().as_ref() != Some(&before)
                 || fs::metadata(process.join("ns/net"))
                     .ok()
@@ -382,16 +405,7 @@ fn scan_v1_focus(
                 return None;
             }
             target.start_time = Some(before.start_time);
-            Some((
-                instance.clone(),
-                FocusTarget {
-                    process: TuiKey {
-                        pid: target.pid,
-                        start_time: before.start_time,
-                    },
-                    konsole,
-                },
-            ))
+            Some((instance.clone(), focus))
         })
         .collect()
 }
@@ -411,14 +425,28 @@ fn process_owns_socket(process: &Path, socket_inode: u64) -> bool {
     })
 }
 
-fn read_konsole_target(process: &Path) -> Option<KonsoleTarget> {
+#[derive(Default)]
+struct FocusEnvironment {
+    konsole_service: Option<Vec<u8>>,
+    konsole_session: Option<Vec<u8>>,
+    konsole_window: Option<Vec<u8>>,
+    kitty_pid: Option<Vec<u8>>,
+    kitty_window_id: Option<Vec<u8>>,
+    kitty_listen_on: Option<Vec<u8>>,
+    konsole_valid: bool,
+    kitty_valid: bool,
+}
+
+fn read_focus_environment(process: &Path) -> Option<FocusEnvironment> {
     let file = File::open(process.join("environ")).ok()?;
     let mut environment = BufReader::new(file.take(MAX_PROCESS_ENVIRONMENT_SIZE + 1));
     let mut total = 0_u64;
     let mut entry = Vec::new();
-    let mut service = None;
-    let mut session_path = None;
-    let mut window_path = None;
+    let mut result = FocusEnvironment {
+        konsole_valid: true,
+        kitty_valid: true,
+        ..FocusEnvironment::default()
+    };
     loop {
         entry.clear();
         let read = environment.read_until(0, &mut entry).ok()?;
@@ -433,36 +461,130 @@ fn read_konsole_target(process: &Path) -> Option<KonsoleTarget> {
             entry.pop();
         }
         if let Some(value) = entry.strip_prefix(b"KONSOLE_DBUS_SERVICE=") {
-            let value = valid_konsole_service(value)?;
-            if service
-                .replace(value.clone())
-                .is_some_and(|old| old != value)
-            {
-                return None;
-            }
+            result.konsole_valid &= set_unique(
+                &mut result.konsole_service,
+                value,
+                MAX_KONSOLE_IDENTIFIER_SIZE,
+            );
         } else if let Some(value) = entry.strip_prefix(b"KONSOLE_DBUS_SESSION=") {
-            let value = valid_konsole_session(value)?;
-            if session_path
-                .replace(value.clone())
-                .is_some_and(|old| old != value)
-            {
-                return None;
-            }
+            result.konsole_valid &= set_unique(
+                &mut result.konsole_session,
+                value,
+                MAX_KONSOLE_IDENTIFIER_SIZE,
+            );
         } else if let Some(value) = entry.strip_prefix(b"KONSOLE_DBUS_WINDOW=") {
-            let value = valid_konsole_window(value)?;
-            if window_path
-                .replace(value.clone())
-                .is_some_and(|old| old != value)
-            {
-                return None;
-            }
+            result.konsole_valid &= set_unique(
+                &mut result.konsole_window,
+                value,
+                MAX_KONSOLE_IDENTIFIER_SIZE,
+            );
+        } else if let Some(value) = entry.strip_prefix(b"KITTY_PID=") {
+            result.kitty_valid &= set_unique(&mut result.kitty_pid, value, MAX_KITTY_PID_SIZE);
+        } else if let Some(value) = entry.strip_prefix(b"KITTY_WINDOW_ID=") {
+            result.kitty_valid &=
+                set_unique(&mut result.kitty_window_id, value, MAX_KITTY_WINDOW_ID_SIZE);
+        } else if let Some(value) = entry.strip_prefix(b"KITTY_LISTEN_ON=") {
+            result.kitty_valid &=
+                set_unique(&mut result.kitty_listen_on, value, MAX_KITTY_LISTEN_ON_SIZE);
         }
     }
-    Some(KonsoleTarget {
-        service: service?,
-        session_path: session_path?,
-        window_path: window_path?,
+    Some(result)
+}
+
+fn set_unique(slot: &mut Option<Vec<u8>>, value: &[u8], max_size: usize) -> bool {
+    if value.len() > max_size {
+        return false;
+    }
+    if slot.as_deref().is_some_and(|old| old != value) {
+        return false;
+    }
+    *slot = Some(value.to_vec());
+    true
+}
+
+fn read_focus_target(proc_root: &Path, process: &Path, key: TuiKey) -> Option<FocusTarget> {
+    let environment = read_focus_environment(process)?;
+    if let Some(kitty) = kitty_target_from_environment(proc_root, key, &environment) {
+        return Some(FocusTarget {
+            process: key,
+            client: ClientFocusTarget::Kitty(kitty),
+        });
+    }
+    konsole_target_from_environment(&environment).map(|konsole| FocusTarget {
+        process: key,
+        client: ClientFocusTarget::Konsole(konsole),
     })
+}
+
+#[cfg(test)]
+fn read_konsole_target(process: &Path) -> Option<KonsoleTarget> {
+    konsole_target_from_environment(&read_focus_environment(process)?)
+}
+
+fn konsole_target_from_environment(environment: &FocusEnvironment) -> Option<KonsoleTarget> {
+    if !environment.konsole_valid {
+        return None;
+    }
+    Some(KonsoleTarget {
+        service: valid_konsole_service(environment.konsole_service.as_deref()?)?,
+        session_path: valid_konsole_session(environment.konsole_session.as_deref()?)?,
+        window_path: valid_konsole_window(environment.konsole_window.as_deref()?)?,
+    })
+}
+
+fn kitty_target_from_environment(
+    proc_root: &Path,
+    tui: TuiKey,
+    environment: &FocusEnvironment,
+) -> Option<KittyTarget> {
+    if !environment.kitty_valid {
+        return None;
+    }
+    let pid = positive_decimal(environment.kitty_pid.as_deref()?)?;
+    let window_id = positive_decimal_u64(environment.kitty_window_id.as_deref()?)?;
+    let socket_path = valid_kitty_socket_path(environment.kitty_listen_on.as_deref()?)?;
+    let process = read_process_stat(&proc_root.join(pid.to_string())).ok()?;
+    let uid = effective_uid(&proc_root.join("self")).ok()?;
+    let socket = valid_kitty_socket(&socket_path, uid)?;
+    let target = KittyTarget {
+        process: TuiKey {
+            pid,
+            start_time: process.start_time,
+        },
+        window_id,
+        socket_path,
+        socket_device: socket.dev(),
+        socket_inode: socket.ino(),
+    };
+    kitty_target_matches(proc_root, tui, &target).then_some(target)
+}
+
+fn positive_decimal(value: &[u8]) -> Option<u32> {
+    let value = std::str::from_utf8(value).ok()?;
+    (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| value.parse::<u32>().ok())
+        .flatten()
+        .filter(|value| *value > 0)
+}
+
+fn positive_decimal_u64(value: &[u8]) -> Option<u64> {
+    let value = std::str::from_utf8(value).ok()?;
+    (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| value.parse::<u64>().ok())
+        .flatten()
+        .filter(|value| *value > 0)
+}
+
+fn valid_kitty_socket_path(value: &[u8]) -> Option<PathBuf> {
+    let value = std::str::from_utf8(value).ok()?;
+    let raw = value.strip_prefix("unix:")?;
+    let path = PathBuf::from(raw);
+    (raw.len() <= MAX_KITTY_SOCKET_PATH_SIZE
+        && path.is_absolute()
+        && path
+            .components()
+            .all(|component| !matches!(component, Component::CurDir | Component::ParentDir)))
+    .then_some(path)
 }
 
 fn valid_konsole_service(value: &[u8]) -> Option<String> {
@@ -492,6 +614,120 @@ fn valid_konsole_window(value: &[u8]) -> Option<String> {
         && !id.is_empty()
         && id.bytes().all(|byte| byte.is_ascii_digit()))
     .then(|| value.to_owned())
+}
+
+pub fn kitty_target_matches(proc_root: &Path, tui: TuiKey, target: &KittyTarget) -> bool {
+    if !process_matches(proc_root, tui) || !process_matches(proc_root, target.process) {
+        return false;
+    }
+    let self_root = proc_root.join("self");
+    let kitty = proc_root.join(target.process.pid.to_string());
+    let tui_process = proc_root.join(tui.pid.to_string());
+    let Some(uid) = effective_uid(&self_root).ok() else {
+        return false;
+    };
+    if effective_uid(&kitty).ok() != Some(uid) || effective_uid(&tui_process).ok() != Some(uid) {
+        return false;
+    }
+    for namespace in ["ns/net", "ns/mnt"] {
+        let Some(expected) = fs::metadata(self_root.join(namespace))
+            .ok()
+            .map(|metadata| metadata.ino())
+        else {
+            return false;
+        };
+        if fs::metadata(kitty.join(namespace))
+            .ok()
+            .map(|metadata| metadata.ino())
+            != Some(expected)
+        {
+            return false;
+        }
+    }
+    if !read_focus_environment(&tui_process)
+        .as_ref()
+        .is_some_and(|environment| kitty_identifiers_match(environment, target))
+    {
+        return false;
+    }
+    let Some(before) = valid_kitty_socket(&target.socket_path, uid) else {
+        return false;
+    };
+    if before.dev() != target.socket_device || before.ino() != target.socket_inode {
+        return false;
+    }
+    let Some(socket_inode) = fs::read_to_string(kitty.join("net/unix"))
+        .ok()
+        .and_then(|contents| unix_listener_inode(&contents, &target.socket_path))
+    else {
+        return false;
+    };
+    process_owns_socket(&kitty, socket_inode)
+        && fs::symlink_metadata(&target.socket_path)
+            .is_ok_and(|after| after.dev() == before.dev() && after.ino() == before.ino())
+        && process_matches(proc_root, tui)
+        && process_matches(proc_root, target.process)
+}
+
+fn valid_kitty_socket(path: &Path, uid: u32) -> Option<fs::Metadata> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    (metadata.file_type().is_socket()
+        && metadata.uid() == uid
+        && fs::canonicalize(path).ok().as_deref() == Some(path)
+        && (metadata.mode() & 0o022 == 0 || has_private_socket_ancestor(path, uid)))
+    .then_some(metadata)
+}
+
+fn has_private_socket_ancestor(path: &Path, uid: u32) -> bool {
+    path.ancestors().skip(1).any(|ancestor| {
+        fs::symlink_metadata(ancestor).is_ok_and(|metadata| {
+            // A directory's low six mode bits are group/other permissions.
+            metadata.file_type().is_dir()
+                && metadata.uid() == uid
+                && metadata.mode().trailing_zeros() >= 6
+        })
+    })
+}
+
+fn kitty_identifiers_match(environment: &FocusEnvironment, target: &KittyTarget) -> bool {
+    environment.kitty_valid
+        && environment.kitty_pid.as_deref().and_then(positive_decimal) == Some(target.process.pid)
+        && environment
+            .kitty_window_id
+            .as_deref()
+            .and_then(positive_decimal_u64)
+            == Some(target.window_id)
+        && environment
+            .kitty_listen_on
+            .as_deref()
+            .and_then(valid_kitty_socket_path)
+            .as_ref()
+            == Some(&target.socket_path)
+}
+
+fn unix_listener_inode(contents: &str, socket_path: &Path) -> Option<u64> {
+    let target = socket_path.to_str()?;
+    let mut matches = contents.lines().skip(1).filter_map(|line| {
+        let (fields, path) = split_unix_socket_row(line)?;
+        let flags = u32::from_str_radix(fields[3], 16).ok()?;
+        (fields[4] == "0001" && fields[5] == "01" && flags & 0x0001_0000 != 0 && path == target)
+            .then(|| fields[6].parse::<u64>().ok())
+            .flatten()
+    });
+    let inode = matches.next()?;
+    matches.next().is_none().then_some(inode)
+}
+
+fn split_unix_socket_row(line: &str) -> Option<([&str; 7], &str)> {
+    let mut rest = line;
+    let mut fields = [""; 7];
+    for field in &mut fields {
+        rest = rest.trim_start_matches(char::is_whitespace);
+        let end = rest.find(char::is_whitespace)?;
+        (*field, rest) = (&rest[..end], &rest[end..]);
+    }
+    let path = rest.trim_start_matches(char::is_whitespace);
+    (!path.is_empty()).then_some((fields, path))
 }
 
 pub fn process_matches(proc_root: &Path, key: TuiKey) -> bool {
@@ -685,13 +921,103 @@ fn invalid_data(error: impl std::error::Error + Send + Sync + 'static) -> io::Er
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::os::unix::net::UnixListener;
 
     use super::*;
     use opencode_beacon::model::InstanceSource;
 
     fn os(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
+    }
+
+    fn write_process(proc_root: &Path, pid: u32, start_time: u64, uid: u32) -> PathBuf {
+        let process = proc_root.join(pid.to_string());
+        assert!(fs::create_dir_all(process.join("fd")).is_ok());
+        assert!(fs::create_dir_all(process.join("ns")).is_ok());
+        assert!(fs::create_dir_all(process.join("net")).is_ok());
+        assert!(
+            fs::write(
+                process.join("status"),
+                format!("Uid:\t{uid}\t{uid}\t{uid}\t{uid}\n")
+            )
+            .is_ok()
+        );
+        assert!(
+            fs::write(
+                process.join("stat"),
+                format!(
+                    "{pid} (process) S 1 0 0 7 {} {start_time}\n",
+                    vec!["0"; 14].join(" ")
+                )
+            )
+            .is_ok()
+        );
+        process
+    }
+
+    fn kitty_fixture() -> (tempfile::TempDir, UnixListener, TuiKey, KittyTarget) {
+        let directory = tempfile::tempdir()
+            .unwrap_or_else(|error| unreachable!("temporary directory: {error}"));
+        let proc_root = directory.path().join("proc");
+        let uid = fs::metadata(directory.path())
+            .unwrap_or_else(|error| unreachable!("metadata: {error}"))
+            .uid();
+        let self_root = write_process(&proc_root, 999, 1, uid);
+        assert!(symlink("999", proc_root.join("self")).is_ok());
+        let tui = TuiKey {
+            pid: 123,
+            start_time: 100,
+        };
+        let tui_process = write_process(&proc_root, tui.pid, tui.start_time, uid);
+        let kitty_process = write_process(&proc_root, 500, 80, uid);
+        let net_namespace = directory.path().join("net-namespace");
+        let mount_namespace = directory.path().join("mount-namespace");
+        assert!(fs::write(&net_namespace, "net").is_ok());
+        assert!(fs::write(&mount_namespace, "mnt").is_ok());
+        for process in [&self_root, &tui_process, &kitty_process] {
+            assert!(symlink(&net_namespace, process.join("ns/net")).is_ok());
+            assert!(symlink(&mount_namespace, process.join("ns/mnt")).is_ok());
+        }
+        let socket_path = directory.path().join("kitty beacon.sock");
+        let listener = UnixListener::bind(&socket_path)
+            .unwrap_or_else(|error| unreachable!("bind synthetic Kitty socket: {error}"));
+        assert!(fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).is_ok());
+        let socket = fs::symlink_metadata(&socket_path)
+            .unwrap_or_else(|error| unreachable!("socket metadata: {error}"));
+        assert!(fs::write(
+            kitty_process.join("net/unix"),
+            format!(
+                "Num RefCount Protocol Flags Type St Inode Path\n00000000: 00000002 00000000 00010000 0001 01 9001 {}\n",
+                socket_path.display()
+            )
+        ).is_ok());
+        assert!(symlink("socket:[9001]", kitty_process.join("fd/7")).is_ok());
+        assert!(
+            fs::write(
+                tui_process.join("environ"),
+                format!(
+                    "KITTY_PID=500\0KITTY_WINDOW_ID=77\0KITTY_LISTEN_ON=unix:{}\0",
+                    socket_path.display()
+                )
+            )
+            .is_ok()
+        );
+        (
+            directory,
+            listener,
+            tui,
+            KittyTarget {
+                process: TuiKey {
+                    pid: 500,
+                    start_time: 80,
+                },
+                window_id: 77,
+                socket_path,
+                socket_device: socket.dev(),
+                socket_inode: socket.ino(),
+            },
+        )
     }
 
     #[test]
@@ -1004,5 +1330,197 @@ mod tests {
             assert!(fs::write(process.join("environ"), environment).is_ok());
             assert!(read_konsole_target(&process).is_none());
         }
+    }
+
+    #[test]
+    fn kitty_target_requires_exact_owned_listener_and_takes_focus_precedence() {
+        let (directory, _listener, tui, expected) = kitty_fixture();
+        let process = directory.path().join("proc/123");
+        let mut environment = fs::read(process.join("environ"))
+            .unwrap_or_else(|error| unreachable!("read environment: {error}"));
+        environment.extend_from_slice(
+            b"KONSOLE_DBUS_SERVICE=:1.108\0KONSOLE_DBUS_SESSION=/Sessions/4\0KONSOLE_DBUS_WINDOW=/Windows/9\0",
+        );
+        assert!(fs::write(process.join("environ"), environment).is_ok());
+
+        assert_eq!(
+            read_focus_target(&directory.path().join("proc"), &process, tui),
+            Some(FocusTarget {
+                process: tui,
+                client: ClientFocusTarget::Kitty(expected.clone()),
+            })
+        );
+        assert!(kitty_target_matches(
+            &directory.path().join("proc"),
+            tui,
+            &expected
+        ));
+    }
+
+    #[test]
+    fn malformed_kitty_evidence_falls_back_to_valid_konsole() {
+        let directory = tempfile::tempdir()
+            .unwrap_or_else(|error| unreachable!("temporary directory: {error}"));
+        let process = directory.path().join("123");
+        assert!(fs::create_dir(&process).is_ok());
+        assert!(fs::write(
+            process.join("environ"),
+            b"KITTY_PID=not-a-pid\0KITTY_WINDOW_ID=7\0KITTY_LISTEN_ON=tcp:localhost:1\0KONSOLE_DBUS_SERVICE=:1.108\0KONSOLE_DBUS_SESSION=/Sessions/4\0KONSOLE_DBUS_WINDOW=/Windows/9\0"
+        ).is_ok());
+        let key = TuiKey {
+            pid: 123,
+            start_time: 100,
+        };
+        assert_eq!(
+            read_focus_target(directory.path(), &process, key),
+            Some(FocusTarget {
+                process: key,
+                client: ClientFocusTarget::Konsole(KonsoleTarget {
+                    service: ":1.108".to_owned(),
+                    session_path: "/Sessions/4".to_owned(),
+                    window_path: "/Windows/9".to_owned(),
+                }),
+            })
+        );
+    }
+
+    #[test]
+    fn kitty_target_rejects_changed_process_socket_and_environment_identity() {
+        let (directory, _listener, tui, target) = kitty_fixture();
+        let proc_root = directory.path().join("proc");
+        assert!(fs::remove_file(proc_root.join("500/fd/7")).is_ok());
+        assert!(!kitty_target_matches(&proc_root, tui, &target));
+        assert!(symlink("socket:[9001]", proc_root.join("500/fd/7")).is_ok());
+
+        assert!(
+            fs::write(
+                proc_root.join("123/environ"),
+                format!(
+                    "KITTY_PID=500\0KITTY_WINDOW_ID=78\0KITTY_LISTEN_ON=unix:{}\0",
+                    target.socket_path.display()
+                )
+            )
+            .is_ok()
+        );
+        assert!(!kitty_target_matches(&proc_root, tui, &target));
+    }
+
+    #[test]
+    fn kitty_target_validates_uid_namespace_effective_privacy_and_socket_identity() {
+        let (directory, _listener, tui, target) = kitty_fixture();
+        let proc_root = directory.path().join("proc");
+        let uid = fs::metadata(directory.path())
+            .unwrap_or_else(|error| unreachable!("metadata: {error}"))
+            .uid();
+
+        assert!(
+            fs::write(
+                proc_root.join("500/status"),
+                format!("Uid:\t{}\t{}\t{}\t{}\n", uid + 1, uid + 1, uid + 1, uid + 1)
+            )
+            .is_ok()
+        );
+        assert!(!kitty_target_matches(&proc_root, tui, &target));
+        assert!(
+            fs::write(
+                proc_root.join("500/status"),
+                format!("Uid:\t{uid}\t{uid}\t{uid}\t{uid}\n")
+            )
+            .is_ok()
+        );
+
+        assert!(fs::remove_file(proc_root.join("500/ns/mnt")).is_ok());
+        let other_namespace = directory.path().join("other-mount-namespace");
+        assert!(fs::write(&other_namespace, "mnt").is_ok());
+        assert!(symlink(&other_namespace, proc_root.join("500/ns/mnt")).is_ok());
+        assert!(!kitty_target_matches(&proc_root, tui, &target));
+        assert!(fs::remove_file(proc_root.join("500/ns/mnt")).is_ok());
+        assert!(
+            symlink(
+                directory.path().join("mount-namespace"),
+                proc_root.join("500/ns/mnt")
+            )
+            .is_ok()
+        );
+
+        assert!(fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).is_ok());
+        assert!(
+            fs::set_permissions(&target.socket_path, fs::Permissions::from_mode(0o775)).is_ok()
+        );
+        assert!(kitty_target_matches(&proc_root, tui, &target));
+        assert!(fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755)).is_ok());
+        assert!(!kitty_target_matches(&proc_root, tui, &target));
+        assert!(
+            fs::set_permissions(&target.socket_path, fs::Permissions::from_mode(0o755)).is_ok()
+        );
+        assert!(kitty_target_matches(&proc_root, tui, &target));
+        assert!(
+            fs::set_permissions(&target.socket_path, fs::Permissions::from_mode(0o600)).is_ok()
+        );
+
+        let replacement_path = directory.path().join("replacement-kitty.sock");
+        let _replacement = UnixListener::bind(&replacement_path)
+            .unwrap_or_else(|error| unreachable!("bind replacement Kitty socket: {error}"));
+        assert!(fs::set_permissions(&replacement_path, fs::Permissions::from_mode(0o600)).is_ok());
+        assert!(fs::rename(&replacement_path, &target.socket_path).is_ok());
+        assert!(!kitty_target_matches(&proc_root, tui, &target));
+    }
+
+    #[test]
+    fn kitty_identifiers_reject_unsupported_addresses_and_conflicts() {
+        for value in [
+            b"tcp:localhost:5000".as_slice(),
+            b"tcp6:[::1]:5000",
+            b"fd:7",
+            b"unix:@abstract",
+            b"unix:relative",
+            b"unix:/tmp/../socket",
+        ] {
+            assert!(
+                valid_kitty_socket_path(value).is_none(),
+                "accepted {value:?}"
+            );
+        }
+        assert_eq!(positive_decimal(b"42"), Some(42));
+        assert_eq!(positive_decimal_u64(b"42"), Some(42));
+        for value in [b"".as_slice(), b"0", b"-1", b"1x"] {
+            assert!(positive_decimal(value).is_none());
+            assert!(positive_decimal_u64(value).is_none());
+        }
+
+        let directory = tempfile::tempdir()
+            .unwrap_or_else(|error| unreachable!("temporary directory: {error}"));
+        let process = directory.path().join("123");
+        assert!(fs::create_dir(&process).is_ok());
+        assert!(
+            fs::write(
+                process.join("environ"),
+                b"KITTY_PID=1\0KITTY_PID=2\0KITTY_WINDOW_ID=7\0KITTY_LISTEN_ON=unix:/tmp/socket\0"
+            )
+            .is_ok()
+        );
+        assert!(
+            !read_focus_environment(&process).is_some_and(|environment| environment.kitty_valid)
+        );
+    }
+
+    #[test]
+    fn unix_listener_parser_ignores_connections_and_rejects_duplicate_listeners() {
+        let path = Path::new("/run/user/1000/kitty beacon.sock");
+        let header = "Num RefCount Protocol Flags Type St Inode Path\n";
+        let connection = "000: 2 0 00000000 0001 03 41 /run/user/1000/kitty beacon.sock\n";
+        let listener = "000: 2 0 00010000 0001 01 42 /run/user/1000/kitty beacon.sock\n";
+        assert_eq!(
+            unix_listener_inode(&format!("{header}{connection}{listener}"), path),
+            Some(42)
+        );
+        assert_eq!(
+            unix_listener_inode(&format!("{header}{listener}{listener}"), path),
+            None
+        );
+        assert_eq!(
+            unix_listener_inode(&format!("{header}{connection}"), path),
+            None
+        );
     }
 }

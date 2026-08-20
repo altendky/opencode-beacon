@@ -116,18 +116,32 @@ mode, alternate screen, mouse mode, and cursor cleanup.
 The separate fixed sampling timer wakes every 10 seconds while dashboard runs;
 it samples cgroup memory and v2 attachment procfs evidence. Raw and watch modes
 create neither sampler nor timer.
-For a stable likely TUI, that sampler also retains only strict bounded Konsole
-D-Bus service/session/window identifiers from a bounded environment read.
+For a stable likely TUI, that sampler also retains only strict bounded
+client-focus identifiers from a bounded environment read. Konsole uses D-Bus
+service/session/window identifiers. Kitty uses its process/window IDs and an
+absolute filesystem Unix remote-control socket, accepted only after same-UID,
+namespace, process-starttime, listener-row, and descriptor validation.
 Procfs-backed v1 instances can provide the same focus evidence directly from
 their exact process identity. The pure model emits a focus action only for a
 non-stale v1 or high-confidence attached v2 row. The binary revalidates identity
-and the exact retained Konsole window/tab. At Enter, it first feature-detects the
+and dispatches through a client-focus backend. For Konsole, it revalidates the
+exact retained window/tab. At Enter, it first feature-detects the
 separately built, versioned bridge tied to that window. When supported, it
 requests a fresh XDG token from Beacon's own inherited Konsole session over
 native D-Bus, revalidates the target, and requests atomic bridge selection and
 activation. Otherwise a sole window uses the checked-in PID-scoped KWin script,
 while multiple windows stop after exact tab selection; either result returns as
 dashboard status.
+For Kitty, Enter re-reads the exact TUI identifiers and revalidates the Kitty
+process and listener socket. It first probes the fixed versioned no-UI custom
+kitten through a narrowly scoped authorization checker. When compatible and a
+fresh token is available from Beacon's active inherited Konsole source, Beacon
+revalidates the target and sends a bounded direct Kitty protocol request; the
+target-local handler selects the exact window/tab and applies the token to its
+containing OS window. Token data remains out of arguments, environment, logs,
+and status. Missing, incompatible, or failing bridge support falls back to the
+official fixed-argument `focus-window` client with ambient password use disabled
+and reports selection without claiming compositor activation.
 On failure, live state remains current and only the journal is discarded.
 Periodic, manual, and coalesced triggers during a snapshot request one follow-up
 snapshot rather than starting concurrent requests.

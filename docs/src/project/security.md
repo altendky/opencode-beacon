@@ -62,7 +62,8 @@ privileges.
 Dashboard's v2 heuristic additionally reads same-UID process socket descriptors,
 network namespace identity, stat/starttime/TTY, argv, and cwd. For focus it reads
 at most 256 KiB of an eligible stable TUI environment, discards every entry but
-strict bounded Konsole D-Bus service/session/window identifiers, and never
+strict bounded Konsole D-Bus service/session/window or Kitty
+process/window/listener identifiers, and never
 retains or renders the broad environment. Procfs-backed v1 uses the same bounded
 extraction from its exact stable process; managed service PIDs are excluded. Attachment
 evidence is never sent to OpenCode and remains display confidence, not an
@@ -86,6 +87,30 @@ after asynchronous token acquisition.
 If bridge negotiation or activation falls back, Beacon repeats PID/starttime,
 D-Bus owner, exact window, and session membership checks immediately before tab
 selection and refreshes the sole/multi-window decision from that validation.
+Kitty focus accepts only canonical absolute filesystem Unix sockets. It verifies
+the same-UID Kitty process and starttime in Beacon's network and mount
+namespaces, correlates exactly one listening `/proc/<pid>/net/unix` row to a
+Kitty-owned descriptor, and checks stable filesystem socket identity before the
+fixed-argument command. A group/other-writable socket must be protected by a
+same-UID private ancestor such as mode-0700 `XDG_RUNTIME_DIR`; otherwise the
+socket must deny group/other writes itself. This accounts for Kitty creating
+sockets according to its launch-time umask without making a publicly reachable
+writable endpoint an accepted target. It does not read remote-control passwords
+or public keys, removes ambient Kitty control/password variables from the child
+command, and forces `--use-password=never`. The recommended Kitty policy
+authorizes only the no-password `focus-window` action. Procfs and pathname checks
+are repeated but remain non-atomic under the same-UID local trust model.
+The optional Kitty bridge does not authorize the remote `kitten` command by
+name. Its custom checker examines the complete no-password socket payload and
+allows only the fixed installed bridge, exact positive target match, versioned
+probe or activation operation, and bounded visible-ASCII token. The trusted
+no-UI handler runs inside Kitty with full internal API authority, so its files
+must remain in the user's private Kitty configuration directory. Beacon probes
+before accessing its inherited Konsole activation source and transports a fresh
+token directly in bounded Unix-socket protocol memory after target revalidation;
+the token is absent from process arguments, environment, files, responses, logs,
+and status. Unsupported versions and checker/handler errors fail closed to the
+ordinary, less-authoritative focus path.
 Cancellation or event-receiver closure discards pending discovery/snapshot
 results and prevents a cancelled pass from publishing credential verification.
 Question and permission payload contents are not printed by default.

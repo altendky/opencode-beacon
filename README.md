@@ -156,6 +156,38 @@ bridge is version-coupled and must be rebuilt after upgrades. See the
 [Konsole Bridge guide](docs/src/project/konsole-bridge.md) for build, install,
 uninstall, dependency, and support details.
 
+Kitty focus uses Kitty's official remote-control interface and needs no plugin
+or compositor-specific helper. Configure a private absolute filesystem Unix
+socket and authorize only the no-password `focus-window` action:
+
+```conf
+allow_remote_control password
+listen_on unix:${XDG_RUNTIME_DIR}/kitty-beacon-{kitty_pid}
+remote_control_password "" focus-window opencode_beacon_rc_auth.py
+```
+
+For exact Wayland OS-window activation on supported Kitty 0.45 installations,
+install the two dependency-free files from `kitty-extension/` into Kitty's
+configuration directory before restarting. The custom checker permits only the
+fixed Beacon bridge probe/activation payload and does not authorize arbitrary
+kittens. Restart Kitty, then launch the OpenCode TUI inside that restarted instance so
+it inherits `KITTY_PID`, `KITTY_WINDOW_ID`, and `KITTY_LISTEN_ON`. A compatible
+`kitten` executable must be on Beacon's `PATH`. Beacon accepts only a canonical,
+same-UID filesystem Unix socket. Group/other write bits from Kitty's launch-time
+umask are accepted beneath a same-UID private ancestor such as mode-0700
+`XDG_RUNTIME_DIR`, but rejected on an otherwise reachable socket. Beacon
+revalidates the Kitty PID/starttime, namespaces, listening socket row, owning
+descriptor, and exact inherited window ID at Enter. It invokes fixed arguments
+with ambient password use disabled. TCP, abstract, relative, and inherited-FD
+endpoints are safe no-ops. Kitty selects the exact pane and tab and requests
+focus for its OS window. When the bridge is compatible and Beacon can acquire a
+fresh token from its active inherited Konsole source, it passes that token only
+in bounded in-memory socket protocol data to the exact target-local kitten.
+Otherwise it safely falls back to ordinary `focus-window`; X11/Wayland policy
+can still deny foreground activation. See the
+[Kitty Focus guide](docs/src/project/kitty-focus.md) for configuration, security,
+compatibility, and acceptance details.
+
 `dashboard` requires terminal stdin/stdout and a non-dumb `TERM`; use `watch`
 for pipes. It restores raw mode, alternate screen, cursor, and mouse state after
 ordinary errors, `q`, Ctrl-C, and `SIGTERM`. `SIGKILL` cannot run cleanup; use
@@ -323,7 +355,7 @@ bootstrap snapshot, not when SSE headers arrive or a bootstrap snapshot fails.
 
 The MVP does not provide notifications, cross-run dashboard persistence,
 OpenCode session control, port scanning, remote discovery, or `/global/event`
-support. Dashboard focus changes only the local Konsole tab/window.
+support. Dashboard focus changes only the local Konsole or Kitty client surface.
 Pending-request attention is reconciled only against the legacy `/permission`
 and `/question` APIs; V2 pending requests are not yet supported.
 V2 activity means exact per-session foreground drains from

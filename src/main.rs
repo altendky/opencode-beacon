@@ -32,7 +32,7 @@ mod memory;
 
 use attachment::AttachmentSampler;
 use dashboard::{DashboardAction, DashboardModel};
-use focus::{FocusResult, focus_konsole};
+use focus::{FocusResult, focus_client};
 use memory::CgroupMemorySampler;
 
 const MEMORY_SAMPLE_INTERVAL: Duration = Duration::from_secs(10);
@@ -266,7 +266,7 @@ async fn run_dashboard(monitor: Monitor) -> Result<(), Box<dyn Error>> {
                             DashboardAction::Focus(request) => {
                                 let message = focus_result_message(
                                     &request.name,
-                                    focus_konsole(&request.target).await,
+                                    focus_client(&request.target).await,
                                 );
                                 model.report_focus_result(&message);
                                 if let Err(error) = terminal.draw(|frame| model.render_at(frame, Instant::now())) {
@@ -328,6 +328,9 @@ fn focus_result_message(name: &str, result: FocusResult) -> String {
         FocusResult::TabSelected => format!(
             "Selected tab for {name}; compositor activation unavailable for multi-window Konsole"
         ),
+        FocusResult::KittySelected => {
+            format!("Selected Kitty pane for {name}; compositor activation was not confirmed")
+        }
         FocusResult::NoOp(reason) => format!("Cannot focus {name}: {reason}"),
         FocusResult::Error(error) => format!("Focus failed for {name}: {error}"),
     }
@@ -860,6 +863,10 @@ mod tests {
         assert_eq!(
             focus_result_message("Root", FocusResult::TabSelected),
             "Selected tab for Root; compositor activation unavailable for multi-window Konsole"
+        );
+        assert_eq!(
+            focus_result_message("Root", FocusResult::KittySelected),
+            "Selected Kitty pane for Root; compositor activation was not confirmed"
         );
     }
 

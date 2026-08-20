@@ -779,7 +779,7 @@ impl DashboardModel {
                 Some("TUI evidence is stale")
             }
             RowCategory::V1 | RowCategory::Attached if row.focus.is_none() => {
-                Some("Konsole identifiers are unavailable")
+                Some("client focus identifiers are unavailable")
             }
             RowCategory::V1 | RowCategory::Attached => None,
         };
@@ -1739,11 +1739,13 @@ mod tests {
             continue_session: false,
             focus: Some(FocusTarget {
                 process,
-                konsole: crate::attachment::KonsoleTarget {
-                    service: ":1.108".to_owned(),
-                    session_path: "/Sessions/1".to_owned(),
-                    window_path: "/Windows/1".to_owned(),
-                },
+                client: crate::attachment::ClientFocusTarget::Konsole(
+                    crate::attachment::KonsoleTarget {
+                        service: ":1.108".to_owned(),
+                        session_path: "/Sessions/1".to_owned(),
+                        window_path: "/Windows/1".to_owned(),
+                    },
+                ),
             }),
             stale: false,
         }
@@ -4016,7 +4018,7 @@ mod tests {
                 .dismissal_status
                 .as_ref()
                 .map(|status| status.message.as_str()),
-            Some("Cannot focus Root: Konsole identifiers are unavailable")
+            Some("Cannot focus Root: client focus identifiers are unavailable")
         );
 
         let process = TuiKey {
@@ -4025,11 +4027,13 @@ mod tests {
         };
         let target = FocusTarget {
             process,
-            konsole: crate::attachment::KonsoleTarget {
-                service: ":1.108".to_owned(),
-                session_path: "/Sessions/1".to_owned(),
-                window_path: "/Windows/1".to_owned(),
-            },
+            client: crate::attachment::ClientFocusTarget::Konsole(
+                crate::attachment::KonsoleTarget {
+                    service: ":1.108".to_owned(),
+                    session_path: "/Sessions/1".to_owned(),
+                    window_path: "/Windows/1".to_owned(),
+                },
+            ),
         };
         model.apply_attachments(
             AttachmentSnapshot {
@@ -4048,6 +4052,35 @@ mod tests {
         );
         assert!(!model.rows[0].dismissed());
         assert_eq!(model.selected, Some(0));
+
+        let kitty = FocusTarget {
+            process,
+            client: crate::attachment::ClientFocusTarget::Kitty(crate::attachment::KittyTarget {
+                process: TuiKey {
+                    pid: 500,
+                    start_time: 5000,
+                },
+                window_id: 7,
+                socket_path: PathBuf::from("/run/user/1000/kitty-beacon-500"),
+                socket_device: 1,
+                socket_inode: 2,
+            }),
+        };
+        model.apply_attachments(
+            AttachmentSnapshot {
+                tuis: Vec::new(),
+                v1_focus: HashMap::from([(key(22, 4022), kitty.clone())]),
+                diagnostic: None,
+            },
+            Instant::now(),
+        );
+        assert_eq!(
+            model.handle_terminal_event(&key_event(KeyCode::Enter), 5),
+            DashboardAction::Focus(FocusRequest {
+                target: kitty,
+                name: "Root".to_owned(),
+            })
+        );
     }
 
     #[test]
@@ -4109,11 +4142,13 @@ mod tests {
         let mut ambiguous = tui(&instance, 26, "/workspace");
         ambiguous.focus = Some(FocusTarget {
             process: ambiguous.key,
-            konsole: crate::attachment::KonsoleTarget {
-                service: ":1.108".to_owned(),
-                session_path: "/Sessions/1".to_owned(),
-                window_path: "/Windows/1".to_owned(),
-            },
+            client: crate::attachment::ClientFocusTarget::Konsole(
+                crate::attachment::KonsoleTarget {
+                    service: ":1.108".to_owned(),
+                    session_path: "/Sessions/1".to_owned(),
+                    window_path: "/Windows/1".to_owned(),
+                },
+            ),
         });
         let mut second = ambiguous.clone();
         second.key.pid = 27;
@@ -4171,11 +4206,13 @@ mod tests {
                 pid: 24,
                 start_time: 240,
             },
-            konsole: crate::attachment::KonsoleTarget {
-                service: ":1.108".to_owned(),
-                session_path: "/Sessions/1".to_owned(),
-                window_path: "/Windows/1".to_owned(),
-            },
+            client: crate::attachment::ClientFocusTarget::Konsole(
+                crate::attachment::KonsoleTarget {
+                    service: ":1.108".to_owned(),
+                    session_path: "/Sessions/1".to_owned(),
+                    window_path: "/Windows/1".to_owned(),
+                },
+            ),
         };
         let mut model = DashboardModel::default();
         model.apply(found(instance.clone(), endpoint));

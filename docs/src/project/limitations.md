@@ -108,6 +108,25 @@
   return compositor confirmation that activation occurred. A partial status
   means only exact Konsole tab selection succeeded. Focus changes no OpenCode
   route or execution state.
+- Kitty focus requires a modern compatible `kitten` executable on `PATH`, a
+  restarted Kitty instance with an absolute filesystem Unix remote-control
+  listener, and newly launched TUI children that inherited `KITTY_PID`,
+  `KITTY_WINDOW_ID`, and `KITTY_LISTEN_ON`. Beacon deliberately rejects TCP,
+  abstract, relative, and inherited-FD endpoints. It validates same-UID process,
+  network/mount namespace, listening socket-object inode, descriptor ownership,
+  and filesystem identity, but those procfs and pathname observations are not
+  atomic. A newer `kitten` client can be rejected by an older Kitty server.
+  Successful `focus-window` response confirms Kitty accepted the exact internal
+  window/tab operation and requested OS-window focus, not that an X11 window
+  manager or Wayland compositor granted foreground activation.
+  The optional exact-activation bridge is tested against Kitty 0.45. It uses
+  documented custom-kitten and authorization loading but the internal Python
+  `Boss.set_active_window(..., activation_token=...)` API is not stable. Other
+  Kitty minor versions deliberately fail closed to ordinary `focus-window`.
+  Exact bridge activation additionally requires a fresh XDG token; Beacon
+  currently obtains one only from its own active inherited Konsole session when
+  that session exposes the validated activation-cookie API. Without that source,
+  fallback selection remains subject to compositor focus-stealing policy.
 - Dashboard exact busy duration begins with Beacon's latest observed non-busy
   state, not the start of work inside OpenCode. An initially busy root instead
   shows how long Beacon has observed it busy as a lower bound (`> Nm`).

@@ -82,8 +82,8 @@ root busy/retry,
 background-only, foreground plus background count, nested descendants, child
 completion, child retry/attention priority, headless background roots, and
 unresolved attachment rows without invented activity.
-Focus tests cover strict bounded Konsole service/session/window environment
-extraction, confident Enter actions, and safe
+Focus tests cover strict bounded Konsole service/session/window and Kitty
+process/window/listener environment extraction, confident Enter actions, and safe
 missing/headless/unresolved/ambiguous/stale no-ops. A mocked fixed-argument D-Bus
 sequence verifies that multi-window focus selects the exact retained tab and
 never invokes KWin activation. Live KDE
@@ -103,6 +103,26 @@ cleanup, metadata, dynamic loading, and real plugin ABI construction. Actual
 per-window D-Bus registration, caller-UID rejection, and compositor activation
 remain explicit post-install acceptance checks because they require a live
 restarted Konsole MainWindow.
+Synthetic Kitty tests cover malformed/conflicting/unsupported inherited
+identifiers, nested-terminal precedence, same-UID PID/starttime and namespace
+validation, exact listening `/proc/net/unix` row and descriptor correlation,
+mode-0775 sockets beneath a same-UID private ancestor, rejection of reachable
+group/other-writable sockets, socket replacement, fixed `kitten` arguments,
+disabled ambient password use, no-match and unavailable-client handling, and
+stale pre-command rejection. Live Kitty acceptance must use an isolated instance
+with the least-privilege policy from the Kitty Focus page and separately observe
+exact pane/tab selection versus best-effort compositor activation.
+Kitty bridge tests additionally cover exact custom authorization, rejection of
+arbitrary kitten execution and mismatched IDs, no-UI target resolution, Kitty
+minor-version feature detection, probe-before-token ordering, token exclusion
+from child arguments/debug output, bounded direct protocol framing, post-token
+target revalidation, exact activation, and safe fallback. Run the extension
+policy tests with:
+
+```console
+python3 -m unittest discover -s kitty-extension/tests -v
+```
+
 Test TTY/TERM and terminal-guard seams independently. A bounded PTY smoke test
 may use one isolated temporary source, exercise resize plus `q`, Ctrl-C, and an
 error, then verify terminal restoration and no child processes. Never cycle real

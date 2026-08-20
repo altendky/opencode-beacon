@@ -239,20 +239,24 @@ background activity, fresh ready, restart, or replacement.
 
 Dashboard attachment sampling may additionally read at most 256 KiB from an
 otherwise eligible stable TUI process environment. It must discard every entry
-except strict bounded `KONSOLE_DBUS_SERVICE`, `KONSOLE_DBUS_SESSION`, and
-`KONSOLE_DBUS_WINDOW` identifiers and must not render or retain the broad
-environment. Procfs-backed v1 may collect the same identifiers from its exact PID after stable
+except strict bounded `KONSOLE_DBUS_SERVICE`, `KONSOLE_DBUS_SESSION`,
+`KONSOLE_DBUS_WINDOW`, `KITTY_PID`, `KITTY_WINDOW_ID`, and `KITTY_LISTEN_ON`
+identifiers and must not render or retain the broad environment. Procfs-backed
+v1 may collect the same identifiers from its exact PID after stable
 PID/starttime/TTY validation; managed service PIDs must not be treated as TUIs.
+Malformed or unvalidated Kitty evidence may fall back to complete valid Konsole
+evidence, while fully validated Kitty evidence takes precedence over inherited
+outer-terminal identifiers.
 
 Enter must emit a focus action only for a connected, non-stale procfs-backed v1
-row or a non-stale high-confidence attached v2 row with complete Konsole
-identifiers. Missing selection/identifiers/targets, headless execution,
+row or a non-stale high-confidence attached v2 row with a complete supported
+client-focus target. Missing selection/identifiers/targets, headless execution,
 unresolved or ambiguous association, stale evidence, PID reuse, and unsupported
-KDE interfaces must produce a clear safe no-op or error. The pure dashboard
+client interfaces must produce a clear safe no-op or error. The pure dashboard
 model must perform no D-Bus, process, or window side effect. At the binary
-boundary the action must freshly validate PID/starttime, verify the D-Bus owner
-and exact tab/window, and select the tab with fixed arguments on the exact
-retained window. It may activate through KWin only when that D-Bus window is the
+boundary every backend must freshly validate PID/starttime. Konsole must verify
+the D-Bus owner and exact tab/window, and select the tab with fixed arguments on
+the exact retained window. It may activate through KWin only when that D-Bus window is the
 process's sole window and there is a unique normal KWin window for that Konsole
 owner PID. Multiple-window selection must report partial success without
 choosing an arbitrary compositor window. It must invoke no shell, retain no
@@ -267,6 +271,42 @@ arguments, then revalidate target PID/starttime, D-Bus owner, window, and sessio
 before the atomic bridge call. Missing, old, mismatched, failed, or tokenless
 bridges must preserve exact-tab and sole-window KWin fallbacks. Cookies and
 tokens must not enter logs, status, retained state, or child-process arguments.
+
+A Kitty target additionally requires positive numeric process and window IDs
+and `KITTY_LISTEN_ON` naming a bounded canonical absolute filesystem Unix
+socket. TCP, abstract, relative, and inherited-FD addresses are unsupported.
+The Kitty process must retain the sampled starttime, current effective UID, and
+Beacon network and mount namespaces. Its `/proc/<pid>/net/unix` must contain
+exactly one stream listening row for the path and one of its descriptors must
+own that socket-object inode. The filesystem socket must be same-UID,
+non-symlink, and canonical. A group/other-writable socket is accepted only when
+its canonical path has a same-UID private ancestor directory with no group/other
+permissions, such as a conforming mode-0700 `XDG_RUNTIME_DIR`; otherwise the
+socket itself must not be group/other writable. Enter must re-read the TUI
+environment and repeat process, namespace, effective-path privacy, socket-row,
+descriptor, and filesystem-identity validation before invoking `kitten` with
+fixed arguments, no shell, no response suppression, and password use disabled.
+Missing or changed evidence must fail closed. Successful remote-control response
+means Kitty accepted pane/tab selection and an OS-window focus request; it does
+not confirm compositor activation and must not change OpenCode route or execution
+state.
+
+Before ordinary Kitty focus, Enter may probe protocol version 1 of the installed
+Beacon no-UI custom kitten using bounded direct Kitty protocol framing. The
+empty-password authorization policy must allow only ordinary `focus-window` and
+the exact bridge filename, positive target ID, protocol version, operation, and
+bounded token shape; it must reject non-socket calls, extra fields, mismatched
+IDs, arbitrary kitten paths, and every other `kitten` payload. Probe must precede
+source-token access. When compatible, Beacon may request a fresh token from its
+active inherited Konsole source, revalidate the full Kitty target, and send the
+token only in in-memory Unix-socket protocol data. The target-local handler must
+feature-detect the tested Kitty internal API, resolve the remote match to the
+same exact internal window ID, select that pane/tab, and apply the token to its
+containing OS window. Tokens must not enter child arguments, environment, logs,
+status, retained state, or bridge responses. Missing source support, incompatible
+Kitty APIs, rejected probes, unavailable tokens, and safe bridge failures must
+preserve a freshly revalidated fixed-argument `focus-window` fallback and report
+partial Kitty selection rather than confirmed compositor activation.
 
 For each admitted connected root whose root status is busy/retry and whose
 attention marker is absent, Dashboard must render right-aligned whole elapsed
