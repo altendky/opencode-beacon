@@ -149,23 +149,24 @@ non-stale Claude row with complete evidence. The binary revalidates identity and
 dispatches through a client-focus backend. Claude provenance additionally
 requires same UID, PID/starttime, TTY, exact executable identity, and unchanged
 allowlisted identifiers at every process check. For Konsole, it revalidates the
-exact retained window/tab. At Enter, it first feature-detects the
-separately built, versioned bridge tied to that window. When supported, it
-requests a fresh XDG token from Beacon's own inherited Konsole session over
-native D-Bus, revalidates the target, and requests atomic bridge selection and
-activation. Otherwise a sole window uses the checked-in PID-scoped KWin script,
-while multiple windows stop after exact tab selection; either result returns as
-dashboard status.
-For Kitty, Enter re-reads the exact TUI identifiers and revalidates the Kitty
-process and listener socket. It first probes the fixed versioned no-UI custom
-kitten through a narrowly scoped authorization checker. When compatible and a
-fresh token is available from Beacon's active inherited Konsole source, Beacon
-revalidates the target and sends a bounded direct Kitty protocol request; the
-target-local handler selects the exact window/tab and applies the token to its
-containing OS window. Token data remains out of arguments, environment, logs,
-and status. Missing, incompatible, or failing bridge support falls back to the
-official fixed-argument `focus-window` client with ambient password use disabled
-and reports selection without claiming compositor activation.
+exact retained window/tab. At Enter, target dispatch receives a target-neutral
+one-use activation-token broker. A compatible target bridge is always negotiated
+before the broker runs. The broker first verifies Beacon's exact inherited Kitty
+pane as the active pane in the compositor-focused Kitty OS window. Protocol
+version 2 requests a fresh token asynchronously and returns it through a private
+mode-0600, nonce-bound, one-shot Unix datagram beneath mode-0700
+`XDG_RUNTIME_DIR`. Missing or inactive Kitty source evidence falls through to
+Beacon's inherited Konsole activation-cookie API. Thus either source can feed
+either exact target bridge without coupling source and destination types.
+For a Konsole target, Beacon revalidates the D-Bus owner, exact window, and tab,
+then passes the generic token to the versioned per-window bridge. Otherwise a
+sole window uses the checked-in PID-scoped KWin script while multiple windows
+stop after exact tab selection. For Kitty, Enter revalidates the Kitty process,
+listener socket, and exact inherited window before passing the same generic token
+to the target-local no-UI handler. Missing, incompatible, or failing bridge
+support falls back to the official fixed-argument `focus-window` client with
+ambient password use disabled. Tokens remain out of arguments, environment,
+files, responses, logs, status, and retained state.
 On failure, live state remains current and only the journal is discarded.
 Periodic, manual, and coalesced triggers during a snapshot request one follow-up
 snapshot rather than starting concurrent requests.

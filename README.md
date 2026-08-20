@@ -202,8 +202,12 @@ descriptor, and exact inherited window ID at Enter. It invokes fixed arguments
 with ambient password use disabled. TCP, abstract, relative, and inherited-FD
 endpoints are safe no-ops. Kitty selects the exact pane and tab and requests
 focus for its OS window. When the bridge is compatible and Beacon can acquire a
-fresh token from its active inherited Konsole source, it passes that token only
-in bounded in-memory socket protocol data to the exact target-local kitten.
+fresh token, it passes that token only in bounded in-memory socket protocol data
+to the exact target-local bridge. Token acquisition is independent of target
+type: Beacon first asks its exact active inherited Kitty pane through a private,
+nonce-bound one-shot Unix datagram callback, then falls back to its inherited
+Konsole activation-cookie API. Either source can activate an exact Kitty or
+Konsole target, including across different Kitty processes on one compositor.
 Otherwise it safely falls back to ordinary `focus-window`; X11/Wayland policy
 can still deny foreground activation. See the
 [Kitty Focus guide](docs/src/project/kitty-focus.md) for configuration, security,

@@ -110,11 +110,11 @@ Konsole windows stop after exact tab selection; ambiguous compositor activation
 and changed targets fail closed.
 The optional bridge registers one same-UID-only D-Bus object per exact Konsole
 ViewManager. It validates bounded arguments and local session membership before
-selection and activation. Beacon negotiates version/capability before reading
-only its own inherited activation source identifiers and cookie at Enter. Native
-D-Bus keeps the cookie and fresh token out of process arguments; neither value is
-logged, rendered, or retained. Target identity and membership are checked again
-after asynchronous token acquisition.
+selection and activation. Beacon negotiates target version/capability before
+asking its target-neutral source broker. Native D-Bus keeps a Konsole source
+cookie and fresh token out of process arguments; neither value is logged,
+rendered, or retained. Target identity and membership are checked again after
+asynchronous token acquisition.
 If bridge negotiation or activation falls back, Beacon repeats PID/starttime,
 D-Bus owner, exact window, and session membership checks immediately before tab
 selection and refreshes the sole/multi-window decision from that validation.
@@ -133,15 +133,21 @@ authorizes only the no-password `focus-window` action. Procfs and pathname check
 are repeated but remain non-atomic under the same-UID local trust model.
 The optional Kitty bridge does not authorize the remote `kitten` command by
 name. Its custom checker examines the complete no-password socket payload and
-allows only the fixed installed bridge, exact positive target match, versioned
-probe or activation operation, and bounded visible-ASCII token. The trusted
+allows only the fixed installed bridge, exact positive match, versioned source or
+target operation, private callback path, nonce, and bounded visible-ASCII token.
+The trusted
 no-UI handler runs inside Kitty with full internal API authority, so its files
-must remain in the user's private Kitty configuration directory. Beacon probes
-before accessing its inherited Konsole activation source and transports a fresh
-token directly in bounded Unix-socket protocol memory after target revalidation;
-the token is absent from process arguments, environment, files, responses, logs,
-and status. Unsupported versions and checker/handler errors fail closed to the
-ordinary, less-authoritative focus path.
+must remain in the user's private Kitty configuration directory. For source use,
+the handler requires Beacon's exact inherited pane to be active in the currently
+compositor-focused Kitty OS window before and after Kitty's asynchronous token
+request. Beacon accepts one strictly bounded nonce-matched datagram through a
+temporary same-UID mode-0600 socket beneath validated mode-0700
+`XDG_RUNTIME_DIR`, then unlinks it and revalidates source and target. The broker
+tries Kitty before Konsole so stale outer-terminal inheritance cannot override
+an active inner Kitty source. Tokens are one-use and absent from process
+arguments, environment, files, bridge responses, logs, and status. Unsupported
+versions and checker/handler errors fail closed to the next source or ordinary
+target fallback.
 Cancellation or event-receiver closure discards pending discovery/snapshot
 results and prevents a cancelled pass from publishing credential verification.
 Question and permission payload contents are not printed by default.

@@ -122,8 +122,8 @@
   multi-window activation, but Konsole has no stable plugin SDK: it must be
   rebuilt against matching private source/build headers and libraries after
   Konsole upgrades. Without a compatible bridge or a fresh token from Beacon's
-  own active inherited Konsole session, multiple windows retain partial exact-tab
-  behavior. A full successful status means Konsole
+  exact active inherited Kitty pane or compatible inherited Konsole session,
+  multiple windows retain partial exact-tab behavior. A full successful status means Konsole
   accepted tab selection and KWin accepted the one-shot script; KWin does not
   return compositor confirmation that activation occurred. A partial status
   means only exact Konsole tab selection succeeded. Focus changes no OpenCode
@@ -141,12 +141,16 @@
   manager or Wayland compositor granted foreground activation.
   The optional exact-activation bridge is tested against Kitty 0.45. It uses
   documented custom-kitten and authorization loading but the internal Python
-  `Boss.set_active_window(..., activation_token=...)` API is not stable. Other
-  Kitty minor versions deliberately fail closed to ordinary `focus-window`.
-  Exact bridge activation additionally requires a fresh XDG token; Beacon
-  currently obtains one only from its own active inherited Konsole session when
-  that session exposes the validated activation-cookie API. Without that source,
-  fallback selection remains subject to compositor focus-stealing policy.
+  target `Boss.set_active_window(..., activation_token=...)` and source
+  `run_with_activation_token()` APIs are not stable. Other Kitty minor versions
+  deliberately fail closed. A Kitty source requires Beacon's inherited pane to
+  be the exact active pane in the focused Kitty OS window and a private writable
+  `XDG_RUNTIME_DIR` for the one-shot callback. The broker otherwise falls back
+  to an inherited Konsole session exposing the validated activation-cookie API.
+  Tokens are compositor-scoped and carry no success acknowledgement; a token
+  transferred between Kitty processes on different compositors can be
+  ineffective. Without either source, fallback selection remains subject to
+  compositor focus-stealing policy.
 - Claude focus inherits the Konsole and Kitty limitations above and additionally
   depends on readable bounded `/proc/<pid>/environ`, stable same-UID PID/starttime
   and TTY evidence, and exact Claude process classification. Environment or PID

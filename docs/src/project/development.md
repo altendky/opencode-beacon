@@ -137,11 +137,15 @@ stale pre-command rejection. Live Kitty acceptance must use an isolated instance
 with the least-privilege policy from the Kitty Focus page and separately observe
 exact pane/tab selection versus best-effort compositor activation.
 Kitty bridge tests additionally cover exact custom authorization, rejection of
-arbitrary kitten execution and mismatched IDs, no-UI target resolution, Kitty
-minor-version feature detection, probe-before-token ordering, token exclusion
-from child arguments/debug output, bounded direct protocol framing, post-token
-target revalidation, exact activation, and safe fallback. Run the extension
-policy tests with:
+arbitrary kitten execution and mismatched IDs, no-UI source/target resolution,
+Kitty minor-version feature detection, target-probe-before-source ordering,
+active source pane and focused OS-window checks before request and callback,
+private callback path/type/owner/mode, cryptographic nonce matching, malformed/
+oversized/spoofed/duplicate/timeout handling, cleanup, token exclusion from child
+arguments/environment/files/responses/debug output, post-token source/target
+revalidation, Kitty-before-Konsole provider ordering, both generic target
+bridges, exact activation, same/different Kitty process transport, and safe
+fallback. Run the extension policy tests with:
 
 ```console
 python3 -m unittest discover -s kitty-extension/tests -v

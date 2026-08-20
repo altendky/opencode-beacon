@@ -30,7 +30,8 @@ Do not replace the checker filename with the `kitten` command in
 `remote_control_password`. Authorizing `kitten` by name would permit arbitrary
 custom Python execution inside Kitty. The checker instead accepts only the exact
 fixed bridge filename, socket transport, positive matched window ID, protocol
-version, operation, and bounded activation token.
+version, source/target operation, private callback, nonce, and bounded activation
+token.
 
 Restart Kitty after changing this startup configuration, then launch the
 OpenCode TUI inside the restarted instance. Kitty sets `KITTY_PID` and, when the
@@ -76,23 +77,29 @@ The argument vector is fixed and no shell is used. Missing, changed,
 unauthorized, unsupported, or stale targets produce dashboard no-op/error status
 without changing OpenCode state.
 
-Before that fallback, Beacon sends a side-effect-free protocol-version-1 probe
+Before target fallback, Beacon sends a side-effect-free protocol-version-2 probe
 directly over the validated socket. On Kitty 0.45, the installed no-UI kitten
-feature-detects the internal activation API while running inside the exact
-matched window's Kitty process. Only after a successful probe does Beacon ask
-its own active inherited Konsole session for a fresh XDG activation token. It
-then revalidates the full Kitty target and sends the token in bounded in-memory
-Kitty protocol JSON, never in child arguments, environment, files, logs, status,
-or responses. The target-local handler atomically selects the exact pane/tab and
-passes the token to that pane's containing OS window.
+feature-detects source and target internal APIs. A target-neutral broker first
+checks whether Beacon itself inherited complete Kitty identifiers. It validates
+that Kitty process and listener exactly like a target, then asks the exact
+inherited pane to prove it is still active in the compositor-focused Kitty OS
+window. Kitty asynchronously requests a token using that surface and recent
+input serial. The callback rechecks focus and sends one bounded nonce-bound
+datagram to a temporary mode-0600 socket under mode-0700 `XDG_RUNTIME_DIR`.
+Beacon closes and unlinks the callback socket, revalidates source and target, and
+passes the one-use token to the exact target bridge. If the Kitty source is
+missing, inactive, incompatible, stale, or timed out, the broker tries Beacon's
+inherited Konsole activation-cookie API. Either source token can activate an
+exact Kitty or Konsole target, including different Kitty processes on the same
+compositor. Tokens never enter child arguments, environment, files, bridge
+responses, logs, status, or retained state.
 
 The bridge is deliberately version-coupled because Kitty documents custom
 kittens but not its internal `Boss` API. Unsupported Kitty minor versions,
 missing files/checker configuration, unavailable source tokens, and bridge
 failures fall back to ordinary `focus-window`. The dashboard reports that partial
-pane selection without claiming compositor activation. Beacon currently has a
-fresh-token source only when it runs inside a compatible active Konsole session;
-the extension does not weaken Kitty's behavior when that source is unavailable.
+pane selection without claiming compositor activation. The extension does not
+weaken Kitty's behavior when no compatible source is available.
 
 Kitty reports acceptance of the internal selection and focus request, not a
 compositor acknowledgement. X11 focus-stealing policy or Wayland activation

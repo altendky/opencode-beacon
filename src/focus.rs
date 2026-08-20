@@ -1,19 +1,19 @@
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
 use secrecy::{ExposeSecret, SecretString};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
+use tokio::net::{UnixDatagram, UnixStream};
 use tokio::process::Command;
 
 use crate::attachment::{
     ClientFocusTarget, FocusTarget, KittyTarget, KonsoleTarget, focus_process_matches,
-    kitty_target_matches,
+    kitty_target_for_process, kitty_target_matches, process_key,
 };
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
@@ -26,12 +26,17 @@ const MAX_ACTIVATION_TOKEN_SIZE: usize = 4096;
 const CURRENT_SESSION_VERIFY_ATTEMPTS: usize = 6;
 const CURRENT_SESSION_VERIFY_INTERVAL: Duration = Duration::from_millis(40);
 const CURRENT_SESSION_VERIFY_TIMEOUT: Duration = Duration::from_millis(500);
-const KITTY_BRIDGE_PROTOCOL_VERSION: &str = "1";
+const KITTY_BRIDGE_PROTOCOL_VERSION: &str = "2";
 const KITTY_BRIDGE_KITTEN: &str = "opencode_beacon_focus.py";
-const KITTY_BRIDGE_PROBE_OK: &str = "opencode-beacon-kitty-bridge/1 ready";
-const KITTY_BRIDGE_ACTIVATE_OK: &str = "opencode-beacon-kitty-bridge/1 activated";
+const KITTY_BRIDGE_PROBE_OK: &str = "opencode-beacon-kitty-bridge/2 target-ready";
+const KITTY_BRIDGE_ACTIVATE_OK: &str = "opencode-beacon-kitty-bridge/2 activated";
+const KITTY_BRIDGE_SOURCE_OK: &str = "opencode-beacon-kitty-bridge/2 source-ready";
+const KITTY_BRIDGE_SOURCE_REQUESTED: &str = "opencode-beacon-kitty-bridge/2 source-token-requested";
 const KITTY_COMMAND_PREFIX: &[u8] = b"\x1bP@kitty-cmd";
 const KITTY_COMMAND_SUFFIX: &[u8] = b"\x1b\\";
+const KITTY_SOURCE_CALLBACK_PREFIX: &str = "opencode-beacon-source-";
+const MAX_KITTY_SOURCE_DATAGRAM_SIZE: usize = 8 * 1024;
+const MAX_KITTY_SOURCE_DATAGRAMS: usize = 8;
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum FocusResult {
@@ -43,23 +48,35 @@ pub enum FocusResult {
 }
 
 pub async fn focus_client(target: &FocusTarget) -> FocusResult {
+    let proc_root = Path::new("/proc");
+    let mut broker = ActivationTokenBroker::new(proc_root);
     match &target.client {
         ClientFocusTarget::Konsole(_) => {
-            focus_konsole_with(target, Path::new("/proc"), &mut QdbusCommands::default()).await
+            focus_konsole_with(
+                target,
+                proc_root,
+                &mut QdbusCommands::default(),
+                &mut broker,
+            )
+            .await
         }
         ClientFocusTarget::Kitty(kitty) => {
-            let mut commands = SystemKittyCommands::default();
-            focus_kitty_with(target, kitty, Path::new("/proc"), &mut commands).await
+            focus_kitty_with(
+                target,
+                kitty,
+                proc_root,
+                &mut SystemKittyCommands,
+                &mut broker,
+            )
+            .await
         }
     }
 }
 
 trait FocusCommands {
     async fn qdbus(&mut self, arguments: &[&str]) -> Result<String, CommandError>;
-    fn activation_source(&mut self) -> Option<ActivationSource>;
     async fn bridge_version(&mut self, service: &str, path: &str) -> Result<u32, ()>;
     async fn bridge_capabilities(&mut self, service: &str, path: &str) -> Result<Vec<String>, ()>;
-    async fn activation_token(&mut self, source: &ActivationSource) -> Result<SecretString, ()>;
     async fn bridge_activate(
         &mut self,
         service: &str,
@@ -95,7 +112,84 @@ impl ActivationSource {
     }
 }
 
+trait ActivationTokenSource {
+    async fn activation_token(&mut self) -> Option<SecretString>;
+}
+
+struct KittyActivationTokenProvider {
+    proc_root: PathBuf,
+}
+
+impl ActivationTokenSource for KittyActivationTokenProvider {
+    async fn activation_token(&mut self) -> Option<SecretString> {
+        kitty_source_activation_token(&self.proc_root).await
+    }
+}
+
+#[derive(Default)]
+struct KonsoleActivationTokenProvider {
+    qdbus: QdbusCommands,
+}
+
+impl ActivationTokenSource for KonsoleActivationTokenProvider {
+    async fn activation_token(&mut self) -> Option<SecretString> {
+        let source = QdbusCommands::activation_source()?;
+        self.qdbus.activation_token(&source).await.ok()
+    }
+}
+
+struct ActivationTokenBroker<K, C> {
+    kitty: K,
+    konsole: C,
+}
+
+impl ActivationTokenBroker<KittyActivationTokenProvider, KonsoleActivationTokenProvider> {
+    fn new(proc_root: &Path) -> Self {
+        Self {
+            kitty: KittyActivationTokenProvider {
+                proc_root: proc_root.to_owned(),
+            },
+            konsole: KonsoleActivationTokenProvider::default(),
+        }
+    }
+}
+
+impl<K: ActivationTokenSource, C: ActivationTokenSource> ActivationTokenSource
+    for ActivationTokenBroker<K, C>
+{
+    async fn activation_token(&mut self) -> Option<SecretString> {
+        if let Some(token) = self.kitty.activation_token().await {
+            return Some(token);
+        }
+        self.konsole.activation_token().await
+    }
+}
+
 impl QdbusCommands {
+    fn activation_source() -> Option<ActivationSource> {
+        ActivationSource::from_environment()
+    }
+
+    async fn activation_token(&mut self, source: &ActivationSource) -> Result<SecretString, ()> {
+        let proxy = self
+            .proxy(
+                &source.service,
+                &source.session_path,
+                "org.kde.konsole.Session",
+            )
+            .await?;
+        let token: String = tokio::time::timeout(
+            COMMAND_TIMEOUT,
+            proxy.call("activationToken", &(source.cookie.expose_secret())),
+        )
+        .await
+        .map_err(|_| ())?
+        .map_err(|_| ())?;
+        valid_activation_token(&token)
+            .then(|| SecretString::from(token))
+            .ok_or(())
+    }
+
     async fn connection(&mut self) -> Result<&zbus::Connection, ()> {
         if self.connection.is_none() {
             self.connection = Some(
@@ -130,10 +224,6 @@ impl FocusCommands for QdbusCommands {
         qdbus(arguments).await
     }
 
-    fn activation_source(&mut self) -> Option<ActivationSource> {
-        ActivationSource::from_environment()
-    }
-
     async fn bridge_version(&mut self, service: &str, path: &str) -> Result<u32, ()> {
         let proxy = self.proxy(service, path, BRIDGE_INTERFACE).await?;
         tokio::time::timeout(COMMAND_TIMEOUT, proxy.call("protocolVersion", &()))
@@ -148,26 +238,6 @@ impl FocusCommands for QdbusCommands {
             .await
             .map_err(|_| ())?
             .map_err(|_| ())
-    }
-
-    async fn activation_token(&mut self, source: &ActivationSource) -> Result<SecretString, ()> {
-        let proxy = self
-            .proxy(
-                &source.service,
-                &source.session_path,
-                "org.kde.konsole.Session",
-            )
-            .await?;
-        let token: String = tokio::time::timeout(
-            COMMAND_TIMEOUT,
-            proxy.call("activationToken", &(source.cookie.expose_secret())),
-        )
-        .await
-        .map_err(|_| ())?
-        .map_err(|_| ())?;
-        valid_activation_token(&token)
-            .then(|| SecretString::from(token))
-            .ok_or(())
     }
 
     async fn bridge_activate(
@@ -189,10 +259,11 @@ impl FocusCommands for QdbusCommands {
 }
 
 #[allow(clippy::too_many_lines)]
-async fn focus_konsole_with<C: FocusCommands>(
+async fn focus_konsole_with<C: FocusCommands, B: ActivationTokenSource>(
     target: &FocusTarget,
     proc_root: &Path,
     commands: &mut C,
+    broker: &mut B,
 ) -> FocusResult {
     let ClientFocusTarget::Konsole(konsole) = &target.client else {
         return FocusResult::Error("invalid Konsole focus target".to_owned());
@@ -247,8 +318,10 @@ async fn focus_konsole_with<C: FocusCommands>(
     if let Err(result) = validate_window_session(commands, konsole, session_id).await {
         return result;
     }
-    if let Some(result) =
-        try_bridge_activation(target, konsole, proc_root, commands, owner_pid, session_id).await
+    if let Some(result) = try_bridge_activation(
+        target, konsole, proc_root, commands, broker, owner_pid, session_id,
+    )
+    .await
     {
         return result;
     }
@@ -352,11 +425,12 @@ async fn focus_konsole_with<C: FocusCommands>(
     }
 }
 
-async fn try_bridge_activation<C: FocusCommands>(
+async fn try_bridge_activation<C: FocusCommands, B: ActivationTokenSource>(
     target: &FocusTarget,
     konsole: &KonsoleTarget,
     proc_root: &Path,
     commands: &mut C,
+    broker: &mut B,
     owner_pid: u32,
     session_id: &str,
 ) -> Option<FocusResult> {
@@ -376,8 +450,7 @@ async fn try_bridge_activation<C: FocusCommands>(
     if !capabilities.iter().any(|value| value == BRIDGE_CAPABILITY) {
         return None;
     }
-    let source = commands.activation_source()?;
-    let token = commands.activation_token(&source).await.ok()?;
+    let token = broker.activation_token().await?;
 
     if !focus_process_matches(proc_root, target) {
         return Some(FocusResult::NoOp(
@@ -594,16 +667,11 @@ fn session_list_contains(sessions: &str, target: &str) -> bool {
 
 trait KittyCommands {
     async fn bridge_supported(&mut self, target: &KittyTarget) -> bool;
-    fn activation_source(&mut self) -> Option<ActivationSource>;
-    async fn activation_token(&mut self, source: &ActivationSource) -> Result<SecretString, ()>;
     async fn bridge_activate(&mut self, target: &KittyTarget, token: &SecretString) -> bool;
     async fn focus(&mut self, target: &KittyTarget) -> Result<(), CommandError>;
 }
 
-#[derive(Default)]
-struct SystemKittyCommands {
-    qdbus: QdbusCommands,
-}
+struct SystemKittyCommands;
 
 impl KittyCommands for SystemKittyCommands {
     async fn bridge_supported(&mut self, target: &KittyTarget) -> bool {
@@ -611,14 +679,6 @@ impl KittyCommands for SystemKittyCommands {
             .await
             .as_deref()
             == Some(KITTY_BRIDGE_PROBE_OK)
-    }
-
-    fn activation_source(&mut self) -> Option<ActivationSource> {
-        self.qdbus.activation_source()
-    }
-
-    async fn activation_token(&mut self, source: &ActivationSource) -> Result<SecretString, ()> {
-        self.qdbus.activation_token(source).await
     }
 
     async fn bridge_activate(&mut self, target: &KittyTarget, token: &SecretString) -> bool {
@@ -633,33 +693,34 @@ impl KittyCommands for SystemKittyCommands {
     }
 }
 
-async fn focus_kitty_with<C: KittyCommands>(
+async fn focus_kitty_with<C: KittyCommands, B: ActivationTokenSource>(
     focus: &FocusTarget,
     target: &KittyTarget,
     proc_root: &Path,
     commands: &mut C,
+    broker: &mut B,
 ) -> FocusResult {
     if !focus_process_matches(proc_root, focus) {
         return FocusResult::NoOp("TUI process identity is stale".to_owned());
     }
-    focus_kitty_target_with(target, commands, || {
+    focus_kitty_target_with(target, commands, broker, || {
         focus_process_matches(proc_root, focus)
             && kitty_target_matches(proc_root, focus.process, target)
     })
     .await
 }
 
-async fn focus_kitty_target_with<C: KittyCommands, V: FnMut() -> bool>(
+async fn focus_kitty_target_with<C: KittyCommands, B: ActivationTokenSource, V: FnMut() -> bool>(
     target: &KittyTarget,
     commands: &mut C,
+    broker: &mut B,
     mut target_matches: V,
 ) -> FocusResult {
     if !target_matches() {
         return FocusResult::NoOp("Kitty target is no longer available".to_owned());
     }
     if commands.bridge_supported(target).await
-        && let Some(source) = commands.activation_source()
-        && let Ok(token) = commands.activation_token(&source).await
+        && let Some(token) = broker.activation_token().await
     {
         if !target_matches() {
             return FocusResult::NoOp(
@@ -698,6 +759,157 @@ async fn focus_kitty_command_with<C: KittyCommands>(
 enum KittyBridgeRequest<'a> {
     Probe,
     Activate(&'a SecretString),
+    SourceProbe,
+    SourceToken {
+        callback_path: &'a Path,
+        nonce: &'a str,
+    },
+}
+
+async fn kitty_source_activation_token(proc_root: &Path) -> Option<SecretString> {
+    let source_process = process_key(proc_root, std::process::id())?;
+    let source = kitty_target_for_process(proc_root, source_process)?;
+    request_kitty_source_activation_token(proc_root, source_process, &source).await
+}
+
+async fn request_kitty_source_activation_token(
+    proc_root: &Path,
+    source_process: crate::attachment::TuiKey,
+    source: &KittyTarget,
+) -> Option<SecretString> {
+    let source_matches = || {
+        process_key(proc_root, source_process.pid) == Some(source_process)
+            && kitty_target_matches(proc_root, source_process, source)
+    };
+    if !source_matches()
+        || kitty_bridge_request(source, KittyBridgeRequest::SourceProbe)
+            .await
+            .as_deref()
+            != Some(KITTY_BRIDGE_SOURCE_OK)
+    {
+        return None;
+    }
+    let receiver = KittySourceTokenReceiver::bind(proc_root)?;
+    if !source_matches()
+        || kitty_bridge_request(
+            source,
+            KittyBridgeRequest::SourceToken {
+                callback_path: &receiver.path,
+                nonce: &receiver.nonce,
+            },
+        )
+        .await
+        .as_deref()
+            != Some(KITTY_BRIDGE_SOURCE_REQUESTED)
+    {
+        return None;
+    }
+    let token = receiver.receive().await?;
+    source_matches().then_some(token)
+}
+
+struct KittySourceTokenReceiver {
+    socket: UnixDatagram,
+    path: PathBuf,
+    nonce: String,
+}
+
+impl KittySourceTokenReceiver {
+    fn bind(proc_root: &Path) -> Option<Self> {
+        let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from)?;
+        let uid = fs::metadata(proc_root.join("self")).ok()?.uid();
+        Self::bind_in(&runtime, uid, std::process::id())
+    }
+
+    fn bind_in(runtime: &Path, uid: u32, pid: u32) -> Option<Self> {
+        let metadata = fs::symlink_metadata(runtime).ok()?;
+        if !runtime.is_absolute()
+            || !metadata.file_type().is_dir()
+            || metadata.uid() != uid
+            || metadata.mode().trailing_zeros() < 6
+            || fs::canonicalize(runtime).ok().as_deref() != Some(runtime)
+        {
+            return None;
+        }
+        let mut random = [0_u8; 32];
+        getrandom::fill(&mut random).ok()?;
+        let nonce = hex(&random);
+        let path = runtime.join(format!(
+            "{KITTY_SOURCE_CALLBACK_PREFIX}{}-{}",
+            pid,
+            hex(&random[..12])
+        ));
+        if path.as_os_str().as_encoded_bytes().len() > 107 || path.exists() {
+            return None;
+        }
+        let socket = UnixDatagram::bind(&path).ok()?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).ok()?;
+        let socket_metadata = fs::symlink_metadata(&path).ok()?;
+        if !socket_metadata.file_type().is_socket()
+            || socket_metadata.uid() != uid
+            || socket_metadata.mode() & 0o077 != 0
+            || fs::canonicalize(&path).ok().as_deref() != Some(path.as_path())
+        {
+            let _ = fs::remove_file(&path);
+            return None;
+        }
+        Some(Self {
+            socket,
+            path,
+            nonce,
+        })
+    }
+
+    async fn receive(&self) -> Option<SecretString> {
+        tokio::time::timeout(COMMAND_TIMEOUT, async {
+            let mut buffer = [0_u8; MAX_KITTY_SOURCE_DATAGRAM_SIZE];
+            for _ in 0..MAX_KITTY_SOURCE_DATAGRAMS {
+                let read = self.socket.recv(&mut buffer).await.ok()?;
+                if read == buffer.len() {
+                    continue;
+                }
+                let Ok(response) = serde_json::from_slice::<serde_json::Value>(&buffer[..read])
+                else {
+                    continue;
+                };
+                let Some(object) = response.as_object() else {
+                    continue;
+                };
+                if object.len() != 3
+                    || object.get("version").and_then(serde_json::Value::as_u64) != Some(2)
+                    || object.get("nonce").and_then(serde_json::Value::as_str)
+                        != Some(self.nonce.as_str())
+                {
+                    continue;
+                }
+                let Some(token) = object.get("token").and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                if valid_activation_token(token) {
+                    return Some(SecretString::from(token.to_owned()));
+                }
+            }
+            None
+        })
+        .await
+        .ok()?
+    }
+}
+
+impl Drop for KittySourceTokenReceiver {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut result = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        result.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        result.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    result
 }
 
 async fn kitty_bridge_request(
@@ -738,13 +950,32 @@ fn encode_kitty_bridge_request(
     let window_id = target.window_id.to_string();
     let args = match request {
         KittyBridgeRequest::Probe => {
-            vec!["probe", KITTY_BRIDGE_PROTOCOL_VERSION, window_id.as_str()]
+            vec![
+                "probe-target",
+                KITTY_BRIDGE_PROTOCOL_VERSION,
+                window_id.as_str(),
+            ]
         }
         KittyBridgeRequest::Activate(token) => vec![
             "activate",
             KITTY_BRIDGE_PROTOCOL_VERSION,
             window_id.as_str(),
             token.expose_secret(),
+        ],
+        KittyBridgeRequest::SourceProbe => vec![
+            "probe-source",
+            KITTY_BRIDGE_PROTOCOL_VERSION,
+            window_id.as_str(),
+        ],
+        KittyBridgeRequest::SourceToken {
+            callback_path,
+            nonce,
+        } => vec![
+            "source-token",
+            KITTY_BRIDGE_PROTOCOL_VERSION,
+            window_id.as_str(),
+            callback_path.to_str()?,
+            nonce,
         ],
     };
     let command = serde_json::json!({
@@ -929,10 +1160,8 @@ mod tests {
         calls: Vec<Vec<String>>,
         responses: VecDeque<Result<String, CommandError>>,
         operations: Vec<&'static str>,
-        source: Option<ActivationSource>,
         bridge_version: Option<Result<u32, ()>>,
         bridge_capabilities: Option<Result<Vec<String>, ()>>,
-        token: Option<Result<SecretString, ()>>,
         activation: Option<Result<bool, ()>>,
         hang_qdbus: bool,
     }
@@ -957,11 +1186,6 @@ mod tests {
                 .unwrap_or_else(|| unreachable!("unexpected qdbus call: {arguments:?}"))
         }
 
-        fn activation_source(&mut self) -> Option<ActivationSource> {
-            self.operations.push("source");
-            self.source.take()
-        }
-
         async fn bridge_version(&mut self, _service: &str, _path: &str) -> Result<u32, ()> {
             self.operations.push("version");
             self.bridge_version.take().unwrap_or(Err(()))
@@ -974,14 +1198,6 @@ mod tests {
         ) -> Result<Vec<String>, ()> {
             self.operations.push("capabilities");
             self.bridge_capabilities.take().unwrap_or(Err(()))
-        }
-
-        async fn activation_token(
-            &mut self,
-            _source: &ActivationSource,
-        ) -> Result<SecretString, ()> {
-            self.operations.push("token");
-            self.token.take().unwrap_or(Err(()))
         }
 
         async fn bridge_activate(
@@ -1001,8 +1217,6 @@ mod tests {
         calls: Vec<KittyTarget>,
         result: Option<Result<(), CommandError>>,
         bridge_supported: bool,
-        source: Option<ActivationSource>,
-        token: Option<Result<SecretString, ()>>,
         activation: bool,
         operations: Vec<&'static str>,
     }
@@ -1011,19 +1225,6 @@ mod tests {
         async fn bridge_supported(&mut self, _target: &KittyTarget) -> bool {
             self.operations.push("probe");
             self.bridge_supported
-        }
-
-        fn activation_source(&mut self) -> Option<ActivationSource> {
-            self.operations.push("source");
-            self.source.take()
-        }
-
-        async fn activation_token(
-            &mut self,
-            _source: &ActivationSource,
-        ) -> Result<SecretString, ()> {
-            self.operations.push("token");
-            self.token.take().unwrap_or(Err(()))
         }
 
         async fn bridge_activate(&mut self, _target: &KittyTarget, _token: &SecretString) -> bool {
@@ -1040,6 +1241,19 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct MockBroker {
+        token: Option<SecretString>,
+        requests: usize,
+    }
+
+    impl ActivationTokenSource for MockBroker {
+        async fn activation_token(&mut self) -> Option<SecretString> {
+            self.requests += 1;
+            self.token.take()
+        }
+    }
+
     fn kitty_target() -> KittyTarget {
         KittyTarget {
             process: TuiKey {
@@ -1050,14 +1264,6 @@ mod tests {
             socket_path: PathBuf::from("/run/user/1000/kitty beacon.sock"),
             socket_device: 1,
             socket_inode: 2,
-        }
-    }
-
-    fn activation_source() -> ActivationSource {
-        ActivationSource {
-            service: ":1.200".to_owned(),
-            session_path: "/Sessions/3".to_owned(),
-            cookie: SecretString::from(format!("{}=", "A".repeat(43))),
         }
     }
 
@@ -1129,7 +1335,7 @@ mod tests {
         assert_eq!(command["payload"]["kitten"], KITTY_BRIDGE_KITTEN);
         assert_eq!(
             command["payload"]["args"],
-            serde_json::json!(["activate", "1", "77", "fresh-token"])
+            serde_json::json!(["activate", "2", "77", "fresh-token"])
         );
         assert_eq!(command["payload"]["match"], "id:77");
         assert!(!format!("{token:?}").contains("fresh-token"));
@@ -1150,6 +1356,150 @@ mod tests {
             )
             .is_none()
         );
+
+        let callback = Path::new("/run/user/1000/beacon-callback.sock");
+        let source = encode_kitty_bridge_request(
+            &target,
+            KittyBridgeRequest::SourceToken {
+                callback_path: callback,
+                nonce: &"a".repeat(64),
+            },
+        )
+        .unwrap_or_else(|| unreachable!("valid source request"));
+        let payload = source
+            .strip_prefix(KITTY_COMMAND_PREFIX)
+            .and_then(|value| value.strip_suffix(KITTY_COMMAND_SUFFIX))
+            .unwrap_or_else(|| unreachable!("fixed source framing"));
+        let command = serde_json::from_slice::<serde_json::Value>(payload)
+            .unwrap_or_else(|error| unreachable!("valid source JSON: {error}"));
+        assert_eq!(
+            command["payload"]["args"],
+            serde_json::json!([
+                "source-token",
+                "2",
+                "77",
+                "/run/user/1000/beacon-callback.sock",
+                "a".repeat(64)
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn kitty_source_callback_is_private_nonce_bound_bounded_and_one_shot() {
+        let directory = tempfile::tempdir()
+            .unwrap_or_else(|error| unreachable!("temporary directory: {error}"));
+        assert!(fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).is_ok());
+        let uid = fs::metadata(directory.path())
+            .unwrap_or_else(|error| unreachable!("runtime metadata: {error}"))
+            .uid();
+        let receiver = KittySourceTokenReceiver::bind_in(directory.path(), uid, 123)
+            .unwrap_or_else(|| unreachable!("private callback receiver"));
+        let callback_path = receiver.path.clone();
+        let sender = UnixDatagram::unbound()
+            .unwrap_or_else(|error| unreachable!("unbound callback sender: {error}"));
+        sender
+            .send_to(b"not-json", &callback_path)
+            .await
+            .unwrap_or_else(|error| unreachable!("send malformed callback: {error}"));
+        sender
+            .send_to(
+                serde_json::json!({
+                    "version": 2,
+                    "nonce": "b".repeat(64),
+                    "token": "spoofed-token",
+                })
+                .to_string()
+                .as_bytes(),
+                &callback_path,
+            )
+            .await
+            .unwrap_or_else(|error| unreachable!("send spoofed callback: {error}"));
+        let oversized = [b'x'; MAX_KITTY_SOURCE_DATAGRAM_SIZE];
+        sender
+            .send_to(&oversized, &callback_path)
+            .await
+            .unwrap_or_else(|error| unreachable!("send oversized callback: {error}"));
+        sender
+            .send_to(
+                serde_json::json!({
+                    "version": 2,
+                    "nonce": receiver.nonce.as_str(),
+                    "token": "fresh-token",
+                })
+                .to_string()
+                .as_bytes(),
+                &callback_path,
+            )
+            .await
+            .unwrap_or_else(|error| unreachable!("send valid callback: {error}"));
+
+        let token = receiver
+            .receive()
+            .await
+            .unwrap_or_else(|| unreachable!("valid nonce-bound token"));
+        assert_eq!(token.expose_secret(), "fresh-token");
+        assert!(!format!("{token:?}").contains("fresh-token"));
+        drop(receiver);
+        assert!(!callback_path.exists());
+
+        assert!(fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755)).is_ok());
+        assert!(KittySourceTokenReceiver::bind_in(directory.path(), uid, 123).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn kitty_source_callback_timeout_is_bounded_and_cleanup_is_owned() {
+        let directory = tempfile::tempdir()
+            .unwrap_or_else(|error| unreachable!("temporary directory: {error}"));
+        assert!(fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).is_ok());
+        let uid = fs::metadata(directory.path())
+            .unwrap_or_else(|error| unreachable!("runtime metadata: {error}"))
+            .uid();
+        let receiver = KittySourceTokenReceiver::bind_in(directory.path(), uid, 123)
+            .unwrap_or_else(|| unreachable!("private callback receiver"));
+        let callback_path = receiver.path.clone();
+        let started = tokio::time::Instant::now();
+
+        assert!(receiver.receive().await.is_none());
+        assert_eq!(started.elapsed(), COMMAND_TIMEOUT);
+        assert!(callback_path.exists());
+        drop(receiver);
+        assert!(!callback_path.exists());
+    }
+
+    #[tokio::test]
+    async fn activation_broker_prefers_active_kitty_then_falls_back_to_konsole() {
+        let mut broker = ActivationTokenBroker {
+            kitty: MockBroker {
+                token: Some(SecretString::from("kitty-token".to_owned())),
+                ..MockBroker::default()
+            },
+            konsole: MockBroker {
+                token: Some(SecretString::from("konsole-token".to_owned())),
+                ..MockBroker::default()
+            },
+        };
+        let token = broker
+            .activation_token()
+            .await
+            .unwrap_or_else(|| unreachable!("Kitty source token"));
+        assert_eq!(token.expose_secret(), "kitty-token");
+        assert_eq!(broker.kitty.requests, 1);
+        assert_eq!(broker.konsole.requests, 0);
+
+        let mut broker = ActivationTokenBroker {
+            kitty: MockBroker::default(),
+            konsole: MockBroker {
+                token: Some(SecretString::from("konsole-token".to_owned())),
+                ..MockBroker::default()
+            },
+        };
+        let token = broker
+            .activation_token()
+            .await
+            .unwrap_or_else(|| unreachable!("Konsole fallback token"));
+        assert_eq!(token.expose_secret(), "konsole-token");
+        assert_eq!(broker.kitty.requests, 1);
+        assert_eq!(broker.konsole.requests, 1);
     }
 
     #[tokio::test]
@@ -1178,7 +1528,7 @@ mod tests {
             assert_eq!(command["payload"]["match"], "id:77");
             assert_eq!(
                 command["payload"]["args"],
-                serde_json::json!(["probe", "1", "77"])
+                serde_json::json!(["probe-target", "2", "77"])
             );
             let response = format!(
                 "{}{{\"ok\":true,\"data\":\"{KITTY_BRIDGE_PROBE_OK}\"}}{}",
@@ -1209,24 +1559,24 @@ mod tests {
         let target = kitty_target();
         let mut commands = MockKittyCommands {
             bridge_supported: true,
-            source: Some(activation_source()),
-            token: Some(Ok(SecretString::from("fresh-token".to_owned()))),
             activation: true,
             ..MockKittyCommands::default()
+        };
+        let mut broker = MockBroker {
+            token: Some(SecretString::from("fresh-token".to_owned())),
+            ..MockBroker::default()
         };
         let mut validations = [true, true].into_iter();
 
         assert_eq!(
-            focus_kitty_target_with(&target, &mut commands, || {
+            focus_kitty_target_with(&target, &mut commands, &mut broker, || {
                 validations.next().unwrap_or(false)
             })
             .await,
             FocusResult::Requested
         );
-        assert_eq!(
-            commands.operations,
-            ["probe", "source", "token", "activate"]
-        );
+        assert_eq!(commands.operations, ["probe", "activate"]);
+        assert_eq!(broker.requests, 1);
         assert!(commands.calls.is_empty());
     }
 
@@ -1237,27 +1587,29 @@ mod tests {
             result: Some(Ok(())),
             ..MockKittyCommands::default()
         };
+        let mut broker = MockBroker::default();
         assert_eq!(
-            focus_kitty_target_with(&target, &mut unavailable, || true).await,
+            focus_kitty_target_with(&target, &mut unavailable, &mut broker, || true).await,
             FocusResult::KittySelected
         );
         assert_eq!(unavailable.operations, ["probe", "fallback"]);
+        assert_eq!(broker.requests, 0);
 
         let mut failed = MockKittyCommands {
             result: Some(Ok(())),
             bridge_supported: true,
-            source: Some(activation_source()),
-            token: Some(Ok(SecretString::from("fresh-token".to_owned()))),
             ..MockKittyCommands::default()
         };
+        let mut broker = MockBroker {
+            token: Some(SecretString::from("fresh-token".to_owned())),
+            ..MockBroker::default()
+        };
         assert_eq!(
-            focus_kitty_target_with(&target, &mut failed, || true).await,
+            focus_kitty_target_with(&target, &mut failed, &mut broker, || true).await,
             FocusResult::KittySelected
         );
-        assert_eq!(
-            failed.operations,
-            ["probe", "source", "token", "activate", "fallback"]
-        );
+        assert_eq!(failed.operations, ["probe", "activate", "fallback"]);
+        assert_eq!(broker.requests, 1);
     }
 
     #[tokio::test]
@@ -1265,21 +1617,24 @@ mod tests {
         let target = kitty_target();
         let mut commands = MockKittyCommands {
             bridge_supported: true,
-            source: Some(activation_source()),
-            token: Some(Ok(SecretString::from("fresh-token".to_owned()))),
             activation: true,
             ..MockKittyCommands::default()
+        };
+        let mut broker = MockBroker {
+            token: Some(SecretString::from("fresh-token".to_owned())),
+            ..MockBroker::default()
         };
         let mut validations = [true, false].into_iter();
 
         assert_eq!(
-            focus_kitty_target_with(&target, &mut commands, || {
+            focus_kitty_target_with(&target, &mut commands, &mut broker, || {
                 validations.next().unwrap_or(false)
             })
             .await,
             FocusResult::NoOp("Kitty target changed while acquiring activation token".to_owned())
         );
-        assert_eq!(commands.operations, ["probe", "source", "token"]);
+        assert_eq!(commands.operations, ["probe"]);
+        assert_eq!(broker.requests, 1);
         assert!(commands.calls.is_empty());
     }
 
@@ -1338,8 +1693,9 @@ mod tests {
         let ClientFocusTarget::Kitty(kitty) = &focus.client else {
             unreachable!("test target is Kitty");
         };
+        let mut broker = MockBroker::default();
         assert_eq!(
-            focus_kitty_with(&focus, kitty, directory.path(), &mut commands,).await,
+            focus_kitty_with(&focus, kitty, directory.path(), &mut commands, &mut broker,).await,
             FocusResult::NoOp("TUI process identity is stale".to_owned())
         );
         assert!(commands.calls.is_empty());
@@ -1388,8 +1744,9 @@ mod tests {
 
         assert!(fs::write(process.join("stat"), stat(101)).is_ok());
         let mut commands = MockCommands::default();
+        let mut broker = MockBroker::default();
         assert_eq!(
-            focus_konsole_with(&konsole, &proc_root, &mut commands).await,
+            focus_konsole_with(&konsole, &proc_root, &mut commands, &mut broker).await,
             FocusResult::NoOp("TUI process identity is stale".to_owned())
         );
         assert!(commands.operations.is_empty());
@@ -1400,8 +1757,9 @@ mod tests {
             b"KONSOLE_DBUS_SERVICE=:1.108\0KONSOLE_DBUS_SESSION=/Sessions/8\0KONSOLE_DBUS_WINDOW=/Windows/11\0"
         ).is_ok());
         let mut commands = MockCommands::default();
+        let mut broker = MockBroker::default();
         assert_eq!(
-            focus_konsole_with(&konsole, &proc_root, &mut commands).await,
+            focus_konsole_with(&konsole, &proc_root, &mut commands, &mut broker).await,
             FocusResult::NoOp("TUI process identity is stale".to_owned())
         );
         assert!(commands.operations.is_empty());
@@ -1416,8 +1774,16 @@ mod tests {
             result: Some(Ok(())),
             ..MockKittyCommands::default()
         };
+        let mut broker = MockBroker::default();
         assert_eq!(
-            focus_kitty_with(&kitty_focus, &kitty, &proc_root, &mut kitty_commands).await,
+            focus_kitty_with(
+                &kitty_focus,
+                &kitty,
+                &proc_root,
+                &mut kitty_commands,
+                &mut broker,
+            )
+            .await,
             FocusResult::NoOp("TUI process identity is stale".to_owned())
         );
         assert!(kitty_commands.calls.is_empty());
@@ -1544,9 +1910,10 @@ mod tests {
             ]),
             ..MockCommands::default()
         };
+        let mut broker = MockBroker::default();
 
         assert_eq!(
-            focus_konsole_with(&target, directory.path(), &mut commands).await,
+            focus_konsole_with(&target, directory.path(), &mut commands, &mut broker).await,
             FocusResult::TabSelected
         );
         assert_eq!(
@@ -1650,7 +2017,6 @@ mod tests {
                 window_path: "/Windows/11".to_owned(),
             }),
         };
-        let cookie = format!("{}=", "A".repeat(43));
         let mut commands = MockCommands {
             responses: VecDeque::from([
                 Ok("500\n".to_owned()),
@@ -1663,20 +2029,18 @@ mod tests {
                 Ok("/\n/Windows/1\n/Windows/11\n".to_owned()),
                 Ok("4\n5\n7\n".to_owned()),
             ]),
-            source: Some(ActivationSource {
-                service: ":1.200".to_owned(),
-                session_path: "/Sessions/3".to_owned(),
-                cookie: SecretString::from(cookie.clone()),
-            }),
             bridge_version: Some(Ok(1)),
             bridge_capabilities: Some(Ok(vec![BRIDGE_CAPABILITY.to_owned()])),
-            token: Some(Ok(SecretString::from("fresh-token".to_owned()))),
             activation: Some(Ok(true)),
             ..MockCommands::default()
         };
+        let mut broker = MockBroker {
+            token: Some(SecretString::from("fresh-token".to_owned())),
+            ..MockBroker::default()
+        };
 
         assert_eq!(
-            focus_konsole_with(&target, directory.path(), &mut commands).await,
+            focus_konsole_with(&target, directory.path(), &mut commands, &mut broker).await,
             FocusResult::Requested
         );
         assert_eq!(
@@ -1690,18 +2054,19 @@ mod tests {
                 "membership",
                 "version",
                 "capabilities",
-                "source",
-                "token",
                 "owner",
                 "windows",
                 "membership",
                 "activate",
             ]
         );
+        assert_eq!(broker.requests, 1);
         assert!(
-            commands.calls.iter().flatten().all(|argument| {
-                !argument.contains(&cookie) && !argument.contains("fresh-token")
-            })
+            commands
+                .calls
+                .iter()
+                .flatten()
+                .all(|argument| { !argument.contains("fresh-token") })
         );
         assert!(commands.calls.iter().all(|arguments| {
             !arguments
@@ -1749,19 +2114,14 @@ mod tests {
                 Ok(String::new()),
                 Ok("7\n".to_owned()),
             ]),
-            source: Some(ActivationSource {
-                service: ":1.200".to_owned(),
-                session_path: "/Sessions/3".to_owned(),
-                cookie: SecretString::from(format!("{}=", "A".repeat(43))),
-            }),
             bridge_version: Some(Ok(1)),
             bridge_capabilities: Some(Ok(vec![BRIDGE_CAPABILITY.to_owned()])),
-            token: Some(Err(())),
             ..MockCommands::default()
         };
+        let mut broker = MockBroker::default();
 
         assert_eq!(
-            focus_konsole_with(&target, directory.path(), &mut commands).await,
+            focus_konsole_with(&target, directory.path(), &mut commands, &mut broker).await,
             FocusResult::TabSelected
         );
         assert_eq!(
@@ -1775,8 +2135,6 @@ mod tests {
                 "membership",
                 "version",
                 "capabilities",
-                "source",
-                "token",
                 "owner",
                 "windows",
                 "membership",
@@ -1784,6 +2142,7 @@ mod tests {
                 "fallback-verify",
             ]
         );
+        assert_eq!(broker.requests, 1);
         assert!(commands.calls.iter().any(|arguments| {
             arguments
                 .iter()
@@ -1829,9 +2188,10 @@ mod tests {
                 ]),
                 ..MockCommands::default()
             };
+            let mut broker = MockBroker::default();
 
             assert_eq!(
-                focus_konsole_with(&target, directory.path(), &mut commands).await,
+                focus_konsole_with(&target, directory.path(), &mut commands, &mut broker).await,
                 FocusResult::NoOp(
                     "Konsole owner identity changed before fallback focus".to_owned()
                 )
@@ -1876,12 +2236,11 @@ mod tests {
         };
         let mut commands = MockCommands {
             bridge_version: Some(Ok(0)),
-            source: Some(ActivationSource {
-                service: ":1.200".to_owned(),
-                session_path: "/Sessions/3".to_owned(),
-                cookie: SecretString::from(format!("{}=", "A".repeat(43))),
-            }),
             ..MockCommands::default()
+        };
+        let mut broker = MockBroker {
+            token: Some(SecretString::from("fresh-token".to_owned())),
+            ..MockBroker::default()
         };
 
         assert_eq!(
@@ -1890,6 +2249,7 @@ mod tests {
                 konsole,
                 Path::new("/unused"),
                 &mut commands,
+                &mut broker,
                 500,
                 "7",
             )
@@ -1897,7 +2257,7 @@ mod tests {
             None
         );
         assert_eq!(commands.operations, ["version"]);
-        assert!(commands.source.is_some());
+        assert_eq!(broker.requests, 0);
     }
 
     #[test]

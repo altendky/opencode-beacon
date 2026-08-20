@@ -1,12 +1,12 @@
 # OpenCode Beacon Kitty Bridge
 
-These dependency-free Python files provide protocol-version-1 exact Kitty
-OS-window activation for Kitty 0.45:
+These dependency-free Python files provide protocol-version-2 activation-token
+source and exact OS-window target support for Kitty 0.45:
 
-- `opencode_beacon_focus.py` is a no-UI custom kitten that runs inside the
-  target Kitty process.
+- `opencode_beacon_focus.py` is a no-UI custom kitten that can request a fresh
+  token from Beacon's exact active source pane or apply one to an exact target.
 - `opencode_beacon_rc_auth.py` authorizes only that kitten's exact bounded
-  probe and activation payloads. It does not authorize arbitrary kittens.
+  source/target payloads. It does not authorize arbitrary kittens.
 
 Install them in Kitty's configuration directory:
 
@@ -20,8 +20,9 @@ install -m 600 kitty-extension/opencode_beacon_focus.py \
 Then use the configuration and restart instructions in the
 [Kitty Focus guide](../docs/src/project/kitty-focus.md). The bridge uses Kitty's
 documented custom-kitten and authorization mechanisms, but its activation call
-is an internal Python API. Unsupported Kitty versions fail closed to Beacon's
-ordinary `focus-window` behavior.
+and source-token callback use internal Python APIs. Unsupported Kitty versions
+fail closed to Beacon's ordinary target focus behavior and the next source
+provider.
 
 Run its dependency-free policy tests with:
 

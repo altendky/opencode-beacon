@@ -1433,6 +1433,7 @@ dependencies = [
  "crossterm",
  "fastrand",
  "futures-util",
+ "getrandom 0.3.4",
  "libc",
  "ratatui",
  "reqwest",

@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
+import os
+import stat
+
+
 BRIDGE_KITTEN = "opencode_beacon_focus.py"
-PROTOCOL_VERSION = "1"
+PROTOCOL_VERSION = "2"
 MAX_ACTIVATION_TOKEN_SIZE = 4096
+MAX_CALLBACK_PATH_SIZE = 107
+NONCE_SIZE = 64
 
 
 def valid_positive_id(value):
@@ -22,6 +28,39 @@ def valid_activation_token(value):
         and 0 < len(value) <= MAX_ACTIVATION_TOKEN_SIZE
         and value.isascii()
         and all(0x21 <= ord(character) <= 0x7E for character in value)
+    )
+
+
+def valid_nonce(value):
+    return (
+        isinstance(value, str)
+        and len(value) == NONCE_SIZE
+        and value.isascii()
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def valid_callback_socket(path):
+    if not isinstance(path, str) or not path or len(os.fsencode(path)) > MAX_CALLBACK_PATH_SIZE:
+        return False
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "")
+    if not runtime or not os.path.isabs(path) or not os.path.isabs(runtime):
+        return False
+    try:
+        runtime = os.path.realpath(runtime)
+        if os.path.commonpath((runtime, path)) != runtime or os.path.realpath(path) != path:
+            return False
+        runtime_stat = os.lstat(runtime)
+        socket_stat = os.lstat(path)
+    except (OSError, ValueError):
+        return False
+    return (
+        stat.S_ISDIR(runtime_stat.st_mode)
+        and runtime_stat.st_uid == os.geteuid()
+        and runtime_stat.st_mode & 0o077 == 0
+        and stat.S_ISSOCK(socket_stat.st_mode)
+        and socket_stat.st_uid == os.geteuid()
+        and socket_stat.st_mode & 0o077 == 0
     )
 
 
@@ -49,10 +88,20 @@ def is_cmd_allowed(pcmd, window, from_socket, extra_data):
     args = payload.get("args")
     if not isinstance(args, list) or not all(isinstance(value, str) for value in args):
         return False
-    if args == ["probe", PROTOCOL_VERSION, window_id]:
+    if args in (
+        ["probe-target", PROTOCOL_VERSION, window_id],
+        ["probe-source", PROTOCOL_VERSION, window_id],
+    ):
         return True
-    return (
+    if (
         len(args) == 4
         and args[:3] == ["activate", PROTOCOL_VERSION, window_id]
         and valid_activation_token(args[3])
+    ):
+        return True
+    return (
+        len(args) == 5
+        and args[:3] == ["source-token", PROTOCOL_VERSION, window_id]
+        and valid_callback_socket(args[3])
+        and valid_nonce(args[4])
     )

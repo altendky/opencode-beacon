@@ -311,13 +311,18 @@ generated script, and report request/partial/no-op/error status in the dashboard
 
 Before fallback activation, Enter may use a versioned Konsole plugin bridge only
 at the object corresponding to the retained exact window. Beacon must negotiate
-the protocol and activation capability before reading its own inherited Konsole
-service, session, and activation cookie. It must request a fresh token from that
-source session at the action, without procfs cookie scraping or command
-arguments, then revalidate target PID/starttime, D-Bus owner, window, and session
-before the atomic bridge call. Missing, old, mismatched, failed, or tokenless
-bridges must preserve exact-tab and sole-window KWin fallbacks. Cookies and
-tokens must not enter logs, status, retained state, or child-process arguments.
+the target protocol and capability before asking a target-neutral broker for a
+fresh token. The broker must try only an exact active inherited Kitty source
+before the inherited Konsole source; missing, inactive, stale, incompatible, or
+failed Kitty evidence must fall through without blocking Konsole. The Konsole
+provider must read only Beacon's inherited service, session, and activation
+cookie at the action and use native D-Bus without procfs cookie scraping or
+command arguments. After any asynchronous source request Beacon must revalidate
+the target PID/starttime, D-Bus owner, exact window, and session before passing
+the same generic one-use token to the bridge. Missing, old, mismatched, failed,
+or tokenless bridges must preserve exact-tab and sole-window KWin fallbacks.
+Cookies and tokens must not enter logs, status, retained state, child-process
+arguments, or environment.
 
 A Kitty target additionally requires positive numeric process and window IDs
 and `KITTY_LISTEN_ON` naming a bounded canonical absolute filesystem Unix
@@ -338,22 +343,33 @@ means Kitty accepted pane/tab selection and an OS-window focus request; it does
 not confirm compositor activation and must not change OpenCode route or execution
 state.
 
-Before ordinary Kitty focus, Enter may probe protocol version 1 of the installed
+Before ordinary Kitty focus, Enter may probe protocol version 2 of the installed
 Beacon no-UI custom kitten using bounded direct Kitty protocol framing. The
 empty-password authorization policy must allow only ordinary `focus-window` and
-the exact bridge filename, positive target ID, protocol version, operation, and
-bounded token shape; it must reject non-socket calls, extra fields, mismatched
-IDs, arbitrary kitten paths, and every other `kitten` payload. Probe must precede
-source-token access. When compatible, Beacon may request a fresh token from its
-active inherited Konsole source, revalidate the full Kitty target, and send the
-token only in in-memory Unix-socket protocol data. The target-local handler must
-feature-detect the tested Kitty internal API, resolve the remote match to the
-same exact internal window ID, select that pane/tab, and apply the token to its
-containing OS window. Tokens must not enter child arguments, environment, logs,
-status, retained state, or bridge responses. Missing source support, incompatible
-Kitty APIs, rejected probes, unavailable tokens, and safe bridge failures must
-preserve a freshly revalidated fixed-argument `focus-window` fallback and report
-partial Kitty selection rather than confirmed compositor activation.
+the exact bridge filename, positive matched ID, protocol version, target
+probe/activation or source probe/token operation, callback path, nonce, and
+bounded token shape. It must reject non-socket calls, extra fields, mismatched
+IDs, arbitrary kitten paths, and every other `kitten` payload. A Kitty source
+must be derived from Beacon's own bounded inherited identifiers and validated as
+the same-UID stable Kitty PID/starttime, namespace, listener, descriptor, socket,
+and exact internal pane. The handler must require that pane to remain active in
+the compositor-focused Kitty OS window both before requesting and when receiving
+the asynchronous token. It must return a valid token only through a same-UID
+mode-0600 Unix datagram socket created beneath canonical same-UID mode-0700
+`XDG_RUNTIME_DIR`, bound to a cryptographically random nonce and strict bounds.
+Beacon must ignore malformed, oversized, mismatched, duplicate, stale, or timed
+out datagrams, close and unlink the socket on every path, revalidate source and
+target after receipt, consume the token for one bridge call, and discard it.
+The target-local handler must feature-detect Kitty 0.45 internal APIs, resolve
+the same exact target window ID, select that pane/tab, and apply the generic
+token to its containing OS window. Tokens must not enter child arguments,
+environment, files, logs, status, retained state, or bridge responses. Missing
+source support, incompatible Kitty APIs, rejected probes, unavailable tokens,
+and safe bridge failures must preserve freshly revalidated target-specific
+fallback and report partial selection rather than confirmed compositor
+activation. Same-process and different-process Kitty source/target pairs must
+use the same flow; tokens from another compositor may be ineffective and must
+not trigger unsafe retries.
 
 For each admitted connected root whose root status is busy/retry and whose
 attention marker is absent, Dashboard must render right-aligned whole elapsed

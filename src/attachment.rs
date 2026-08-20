@@ -608,6 +608,20 @@ fn kitty_target_from_environment(
     kitty_target_matches(proc_root, tui, &target).then_some(target)
 }
 
+pub fn process_key(proc_root: &Path, pid: u32) -> Option<TuiKey> {
+    let process = read_process_stat(&proc_root.join(pid.to_string())).ok()?;
+    (process.pid == pid).then_some(TuiKey {
+        pid,
+        start_time: process.start_time,
+    })
+}
+
+pub fn kitty_target_for_process(proc_root: &Path, process: TuiKey) -> Option<KittyTarget> {
+    let path = proc_root.join(process.pid.to_string());
+    let environment = read_focus_environment(&path)?;
+    kitty_target_from_environment(proc_root, process, &environment)
+}
+
 fn positive_decimal(value: &[u8]) -> Option<u32> {
     let value = std::str::from_utf8(value).ok()?;
     (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
@@ -1497,6 +1511,14 @@ mod tests {
             tui,
             &expected
         ));
+        assert_eq!(
+            process_key(&directory.path().join("proc"), tui.pid),
+            Some(tui)
+        );
+        assert_eq!(
+            kitty_target_for_process(&directory.path().join("proc"), tui),
+            Some(expected)
+        );
     }
 
     #[test]
