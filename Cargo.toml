@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT OR Apache-2.0"
-description = "Discover and monitor local OpenCode servers"
+description = "Monitor local OpenCode and Claude Code activity"
 repository = "https://github.com/altendky/opencode-beacon"
 homepage = "https://github.com/altendky/opencode-beacon"
 readme = "README.md"
@@ -28,6 +28,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 crossterm = { version = "0.29", features = ["event-stream"] }
 fastrand = "2.3"
 futures-util = "0.3"
+libc = "0.2"
 ratatui = "0.30"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
 secrecy = "0.10"

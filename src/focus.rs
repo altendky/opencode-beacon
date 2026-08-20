@@ -12,8 +12,8 @@ use tokio::net::UnixStream;
 use tokio::process::Command;
 
 use crate::attachment::{
-    ClientFocusTarget, FocusTarget, KittyTarget, KonsoleTarget, kitty_target_matches,
-    process_matches,
+    ClientFocusTarget, FocusTarget, KittyTarget, KonsoleTarget, focus_process_matches,
+    kitty_target_matches,
 };
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
@@ -49,7 +49,7 @@ pub async fn focus_client(target: &FocusTarget) -> FocusResult {
         }
         ClientFocusTarget::Kitty(kitty) => {
             let mut commands = SystemKittyCommands::default();
-            focus_kitty_with(target.process, kitty, Path::new("/proc"), &mut commands).await
+            focus_kitty_with(target, kitty, Path::new("/proc"), &mut commands).await
         }
     }
 }
@@ -197,7 +197,7 @@ async fn focus_konsole_with<C: FocusCommands>(
     let ClientFocusTarget::Konsole(konsole) = &target.client else {
         return FocusResult::Error("invalid Konsole focus target".to_owned());
     };
-    if !process_matches(proc_root, target.process) {
+    if !focus_process_matches(proc_root, target) {
         return FocusResult::NoOp("TUI process identity is stale".to_owned());
     }
 
@@ -231,7 +231,7 @@ async fn focus_konsole_with<C: FocusCommands>(
         return result;
     }
 
-    if !process_matches(proc_root, target.process) {
+    if !focus_process_matches(proc_root, target) {
         return FocusResult::NoOp("TUI process identity changed before focus".to_owned());
     }
     match dbus_owner_pid(commands, &konsole.service).await {
@@ -253,7 +253,7 @@ async fn focus_konsole_with<C: FocusCommands>(
         return result;
     }
 
-    if !process_matches(proc_root, target.process) {
+    if !focus_process_matches(proc_root, target) {
         return FocusResult::NoOp("TUI process identity changed before fallback focus".to_owned());
     }
     match dbus_owner_pid(commands, &konsole.service).await {
@@ -297,7 +297,7 @@ async fn focus_konsole_with<C: FocusCommands>(
         }
         Err(error) => return command_error(error),
     }
-    if !process_matches(proc_root, target.process) {
+    if !focus_process_matches(proc_root, target) {
         return FocusResult::NoOp("TUI process identity changed before activation".to_owned());
     }
 
@@ -379,7 +379,7 @@ async fn try_bridge_activation<C: FocusCommands>(
     let source = commands.activation_source()?;
     let token = commands.activation_token(&source).await.ok()?;
 
-    if !process_matches(proc_root, target.process) {
+    if !focus_process_matches(proc_root, target) {
         return Some(FocusResult::NoOp(
             "TUI process identity changed while acquiring activation token".to_owned(),
         ));
@@ -634,16 +634,17 @@ impl KittyCommands for SystemKittyCommands {
 }
 
 async fn focus_kitty_with<C: KittyCommands>(
-    tui: crate::attachment::TuiKey,
+    focus: &FocusTarget,
     target: &KittyTarget,
     proc_root: &Path,
     commands: &mut C,
 ) -> FocusResult {
-    if !process_matches(proc_root, tui) {
+    if !focus_process_matches(proc_root, focus) {
         return FocusResult::NoOp("TUI process identity is stale".to_owned());
     }
     focus_kitty_target_with(target, commands, || {
-        kitty_target_matches(proc_root, tui, target)
+        focus_process_matches(proc_root, focus)
+            && kitty_target_matches(proc_root, focus.process, target)
     })
     .await
 }
@@ -918,9 +919,10 @@ impl Drop for OneShotScript {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::os::unix::fs::MetadataExt;
 
     use super::*;
-    use crate::attachment::{KonsoleTarget, TuiKey};
+    use crate::attachment::{FocusProcessSource, KonsoleTarget, TuiKey};
 
     #[derive(Default)]
     struct MockCommands {
@@ -1325,20 +1327,100 @@ mod tests {
             result: Some(Ok(())),
             ..MockKittyCommands::default()
         };
+        let focus = FocusTarget {
+            process: TuiKey {
+                pid: 123,
+                start_time: 100,
+            },
+            source: FocusProcessSource::OpenCode,
+            client: ClientFocusTarget::Kitty(kitty_target()),
+        };
+        let ClientFocusTarget::Kitty(kitty) = &focus.client else {
+            unreachable!("test target is Kitty");
+        };
         assert_eq!(
-            focus_kitty_with(
-                TuiKey {
-                    pid: 123,
-                    start_time: 100,
-                },
-                &kitty_target(),
-                directory.path(),
-                &mut commands,
-            )
-            .await,
+            focus_kitty_with(&focus, kitty, directory.path(), &mut commands,).await,
             FocusResult::NoOp("TUI process identity is stale".to_owned())
         );
         assert!(commands.calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn claude_focus_revalidates_pid_starttime_and_identifiers_before_commands() {
+        let directory = tempfile::tempdir()
+            .unwrap_or_else(|error| unreachable!("temporary directory: {error}"));
+        let proc_root = directory.path().join("proc");
+        let self_process = proc_root.join("self");
+        let process = proc_root.join("123");
+        assert!(fs::create_dir_all(&self_process).is_ok());
+        assert!(fs::create_dir_all(&process).is_ok());
+        let uid = fs::metadata(directory.path())
+            .unwrap_or_else(|error| unreachable!("metadata: {error}"))
+            .uid();
+        let status = format!("Uid:\t{uid}\t{uid}\t{uid}\t{uid}\n");
+        assert!(fs::write(self_process.join("status"), &status).is_ok());
+        assert!(fs::write(process.join("status"), status).is_ok());
+        assert!(fs::write(process.join("cmdline"), b"claude\0").is_ok());
+        assert!(fs::write(
+            process.join("environ"),
+            b"KONSOLE_DBUS_SERVICE=:1.108\0KONSOLE_DBUS_SESSION=/Sessions/7\0KONSOLE_DBUS_WINDOW=/Windows/11\0"
+        ).is_ok());
+        let stat = |start_time| {
+            format!(
+                "123 (claude) S 1 0 0 7 {} {start_time}\n",
+                vec!["0"; 14].join(" ")
+            )
+        };
+        assert!(fs::write(process.join("stat"), stat(100)).is_ok());
+        let konsole = FocusTarget {
+            process: TuiKey {
+                pid: 123,
+                start_time: 100,
+            },
+            source: FocusProcessSource::Claude,
+            client: ClientFocusTarget::Konsole(KonsoleTarget {
+                service: ":1.108".to_owned(),
+                session_path: "/Sessions/7".to_owned(),
+                window_path: "/Windows/11".to_owned(),
+            }),
+        };
+        assert!(focus_process_matches(&proc_root, &konsole));
+
+        assert!(fs::write(process.join("stat"), stat(101)).is_ok());
+        let mut commands = MockCommands::default();
+        assert_eq!(
+            focus_konsole_with(&konsole, &proc_root, &mut commands).await,
+            FocusResult::NoOp("TUI process identity is stale".to_owned())
+        );
+        assert!(commands.operations.is_empty());
+
+        assert!(fs::write(process.join("stat"), stat(100)).is_ok());
+        assert!(fs::write(
+            process.join("environ"),
+            b"KONSOLE_DBUS_SERVICE=:1.108\0KONSOLE_DBUS_SESSION=/Sessions/8\0KONSOLE_DBUS_WINDOW=/Windows/11\0"
+        ).is_ok());
+        let mut commands = MockCommands::default();
+        assert_eq!(
+            focus_konsole_with(&konsole, &proc_root, &mut commands).await,
+            FocusResult::NoOp("TUI process identity is stale".to_owned())
+        );
+        assert!(commands.operations.is_empty());
+
+        let kitty = kitty_target();
+        let kitty_focus = FocusTarget {
+            process: konsole.process,
+            source: FocusProcessSource::Claude,
+            client: ClientFocusTarget::Kitty(kitty.clone()),
+        };
+        let mut kitty_commands = MockKittyCommands {
+            result: Some(Ok(())),
+            ..MockKittyCommands::default()
+        };
+        assert_eq!(
+            focus_kitty_with(&kitty_focus, &kitty, &proc_root, &mut kitty_commands).await,
+            FocusResult::NoOp("TUI process identity is stale".to_owned())
+        );
+        assert!(kitty_commands.calls.is_empty());
     }
 
     #[tokio::test(start_paused = true)]
@@ -1438,6 +1520,7 @@ mod tests {
                 pid: 123,
                 start_time: 100,
             },
+            source: FocusProcessSource::OpenCode,
             client: ClientFocusTarget::Konsole(KonsoleTarget {
                 service: ":1.108".to_owned(),
                 session_path: "/Sessions/7".to_owned(),
@@ -1560,6 +1643,7 @@ mod tests {
                 pid: 123,
                 start_time: 100,
             },
+            source: FocusProcessSource::OpenCode,
             client: ClientFocusTarget::Konsole(KonsoleTarget {
                 service: ":1.108".to_owned(),
                 session_path: "/Sessions/7".to_owned(),
@@ -1644,6 +1728,7 @@ mod tests {
                 pid: 123,
                 start_time: 100,
             },
+            source: FocusProcessSource::OpenCode,
             client: ClientFocusTarget::Konsole(KonsoleTarget {
                 service: ":1.108".to_owned(),
                 session_path: "/Sessions/7".to_owned(),
@@ -1725,6 +1810,7 @@ mod tests {
                     pid: 123,
                     start_time: 100,
                 },
+                source: FocusProcessSource::OpenCode,
                 client: ClientFocusTarget::Konsole(KonsoleTarget {
                     service: ":1.108".to_owned(),
                     session_path: "/Sessions/7".to_owned(),
@@ -1778,6 +1864,7 @@ mod tests {
                 pid: 123,
                 start_time: 100,
             },
+            source: FocusProcessSource::OpenCode,
             client: ClientFocusTarget::Konsole(KonsoleTarget {
                 service: ":1.108".to_owned(),
                 session_path: "/Sessions/7".to_owned(),
@@ -1882,6 +1969,7 @@ mod tests {
             .unwrap_or_else(|_| unreachable!("set OPENCODE_BEACON_TEST_KONSOLE_WINDOW"));
         let result = focus_client(&FocusTarget {
             process: TuiKey { pid, start_time },
+            source: FocusProcessSource::OpenCode,
             client: ClientFocusTarget::Konsole(KonsoleTarget {
                 service,
                 session_path,

@@ -9,6 +9,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, Sleep};
 use tokio_util::sync::CancellationToken;
 
+use crate::claude::{ClaudeConfig, ClaudeDiscovery, ClaudeTracker, scan as scan_claude};
 use crate::client::{
     ClientConfig, OpenCodeClient, OpenCodeV2Client, SourceEvent, SourceEventStream,
 };
@@ -44,6 +45,7 @@ pub struct MonitorConfig {
     pub client: ClientConfig,
     pub discovery: DiscoveryConfig,
     pub managed_discovery: ManagedDiscoveryConfig,
+    pub claude: ClaudeConfig,
 }
 
 impl Default for MonitorConfig {
@@ -57,6 +59,7 @@ impl Default for MonitorConfig {
             client: ClientConfig::default(),
             discovery: DiscoveryConfig::default(),
             managed_discovery: ManagedDiscoveryConfig::default(),
+            claude: ClaudeConfig::default(),
         }
     }
 }
@@ -87,6 +90,11 @@ impl MonitorConfig {
         if self.discovery.probe_concurrency == 0 {
             return Err(MonitorConfigError::ZeroCapacity {
                 field: "probe_concurrency",
+            });
+        }
+        if self.claude.enabled && self.claude.poll_interval.is_zero() {
+            return Err(MonitorConfigError::ZeroDuration {
+                field: "claude.poll_interval",
             });
         }
         Ok(())
@@ -135,7 +143,7 @@ impl Monitor {
             sender: events_tx,
             shutdown: shutdown.clone(),
         };
-        let join = tokio::spawn(run_discovery(
+        let join = tokio::spawn(run_monitor(
             self.config,
             sink,
             resync_rx,
@@ -147,6 +155,82 @@ impl Monitor {
             events: events_rx,
             control,
             join: Some(join),
+        }
+    }
+}
+
+async fn run_monitor(
+    config: MonitorConfig,
+    sink: EventSink,
+    resync: watch::Receiver<u64>,
+    discovery_tx: watch::Sender<u64>,
+    discovery_rx: watch::Receiver<u64>,
+    shutdown: CancellationToken,
+) {
+    let claude = run_claude(
+        config.claude.clone(),
+        sink.clone(),
+        resync.clone(),
+        shutdown.clone(),
+    );
+    let opencode = run_discovery(config, sink, resync, discovery_tx, discovery_rx, shutdown);
+    tokio::join!(opencode, claude);
+}
+
+async fn run_claude(
+    config: ClaudeConfig,
+    sink: EventSink,
+    mut resync: watch::Receiver<u64>,
+    shutdown: CancellationToken,
+) {
+    if !config.enabled {
+        return;
+    }
+    let interval_duration = config.poll_interval;
+    let discovery = ClaudeDiscovery::new(config);
+    let mut tracker = ClaudeTracker::default();
+    let mut interval = tokio::time::interval(interval_duration);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => break,
+            () = sink.sender.closed() => {
+                sink.shutdown.cancel();
+                break;
+            }
+            _ = interval.tick() => {}
+            changed = resync.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+            }
+        }
+        let result = scan_claude(&discovery, || {
+            shutdown.is_cancelled() || sink.sender.is_closed()
+        })
+        .await;
+        let events = match result {
+            Ok(Some(observed)) => tracker.apply_success(observed),
+            Ok(None) => {
+                if sink.sender.is_closed() {
+                    sink.shutdown.cancel();
+                }
+                return;
+            }
+            Err(error) => {
+                let mut events = tracker.apply_failure();
+                events.push(BeaconEvent::Diagnostic {
+                    endpoint: None,
+                    message: format!("Claude discovery failed: {error}"),
+                    verbose_only: true,
+                });
+                events
+            }
+        };
+        for event in events {
+            if sink.send(&shutdown, event).await.is_err() {
+                return;
+            }
         }
     }
 }
@@ -1602,6 +1686,10 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::{
+        fs,
+        os::unix::fs::{MetadataExt, symlink},
+    };
 
     use futures_util::stream;
     use secrecy::SecretString;
@@ -1610,6 +1698,103 @@ mod tests {
     use super::*;
     use crate::client::BasicAuth;
     use crate::model::{AttentionKind, QuestionRequest, Session, SessionStatus};
+
+    #[tokio::test]
+    async fn claude_provider_resyncs_and_stops_with_shared_cancellation() {
+        let directory = tempfile::tempdir()
+            .unwrap_or_else(|error| unreachable!("temporary directory: {error}"));
+        let proc_root = directory.path().join("proc");
+        let config_dir = directory.path().join("claude");
+        let process = proc_root.join("321");
+        assert!(fs::create_dir_all(proc_root.join("self")).is_ok());
+        assert!(fs::create_dir_all(&process).is_ok());
+        assert!(fs::create_dir_all(config_dir.join("sessions")).is_ok());
+        let uid = fs::metadata(directory.path())
+            .unwrap_or_else(|error| unreachable!("metadata: {error}"))
+            .uid();
+        for root in [proc_root.join("self"), process.clone()] {
+            assert!(
+                fs::write(
+                    root.join("status"),
+                    format!("Uid:\t{uid}\t{uid}\t{uid}\t{uid}\n")
+                )
+                .is_ok()
+            );
+        }
+        assert!(
+            fs::write(
+                process.join("stat"),
+                "321 (claude) S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 77 0\n"
+            )
+            .is_ok()
+        );
+        let executable = directory.path().join("bin/claude");
+        assert!(
+            fs::create_dir_all(
+                executable
+                    .parent()
+                    .unwrap_or_else(|| unreachable!("binary has parent"))
+            )
+            .is_ok()
+        );
+        assert!(fs::write(&executable, "binary").is_ok());
+        assert!(symlink(executable, process.join("exe")).is_ok());
+        let marker_path = config_dir.join("sessions/321.json");
+        let write_marker = |status: &str| {
+            fs::write(
+                &marker_path,
+                serde_json::to_vec(&json!({
+                    "pid": 321,
+                    "sessionId": "session-321",
+                    "cwd": "/workspace/claude",
+                    "status": status,
+                }))
+                .unwrap_or_else(|error| unreachable!("marker JSON: {error}")),
+            )
+        };
+        assert!(write_marker("idle").is_ok());
+
+        let shutdown = CancellationToken::new();
+        let (sender, mut receiver) = mpsc::channel(16);
+        let sink = EventSink {
+            sender,
+            shutdown: shutdown.clone(),
+        };
+        let (resync_tx, resync_rx) = watch::channel(0_u64);
+        let task = tokio::spawn(run_claude(
+            ClaudeConfig {
+                enabled: true,
+                poll_interval: Duration::from_secs(3600),
+                config_dir: Some(config_dir),
+                proc_root,
+            },
+            sink,
+            resync_rx,
+            shutdown.clone(),
+        ));
+        assert!(matches!(
+            receiver.recv().await,
+            Some(BeaconEvent::ClaudeSessionFound(_))
+        ));
+        assert!(matches!(
+            receiver.recv().await,
+            Some(BeaconEvent::ClaudeStateProjection(_))
+        ));
+
+        assert!(write_marker("busy").is_ok());
+        resync_tx.send_replace(1);
+        assert!(matches!(
+            receiver.recv().await,
+            Some(BeaconEvent::ClaudeTransition(_))
+        ));
+        assert!(matches!(
+            receiver.recv().await,
+            Some(BeaconEvent::ClaudeStateProjection(_))
+        ));
+
+        shutdown.cancel();
+        assert!(task.await.is_ok());
+    }
 
     struct ScriptedClient {
         endpoint: ServerEndpoint,
@@ -2245,6 +2430,22 @@ mod tests {
         assert!(
             std::iter::from_fn(|| receiver.try_recv().ok())
                 .all(|event| !matches!(event, BeaconEvent::Attention { .. }))
+        );
+    }
+
+    #[test]
+    fn claude_monitoring_defaults_on_and_remains_programmatically_disableable() {
+        assert!(MonitorConfig::default().claude.enabled);
+        assert!(ClaudeConfig::default().enabled);
+        assert!(
+            Monitor::new(MonitorConfig {
+                claude: ClaudeConfig {
+                    enabled: false,
+                    ..ClaudeConfig::default()
+                },
+                ..MonitorConfig::default()
+            })
+            .is_ok()
         );
     }
 

@@ -1,5 +1,25 @@
 # Limitations
 
+- Claude Code monitoring is enabled by default and Linux-only, with Claude Code
+  2.1.160 as its initial compatibility target. `--no-claude` disables it for one
+  CLI invocation. Its per-PID marker directory is an internal interface, not a
+  documented stable API; tolerant parsing and unknown-state handling reduce but
+  cannot eliminate version-compatibility risk.
+- Claude marker and procfs observations are not atomic. PID/starttime and UID
+  checks reject ordinary reuse and cross-user evidence, but another process
+  under the same UID remains a trusted local principal and can forge markers.
+- Claude polling can lag a state change by the configured one-second interval.
+  Two successful misses delay removal, while scan failures retain stale rows.
+- Claude monitoring covers live per-PID markers only. It does not parse saved
+  transcripts or preserve completed background-agent history, and it does not
+  invoke the slower `claude agents --json` interface.
+- Claude rows have no OpenCode attachment, cgroup-memory attribution,
+  prompt/question/permission classification, session control, or notifications.
+  Terminal focus is available only when the exact live Claude process has a TTY
+  and inherited complete supported Konsole or Kitty identifiers; headless,
+  stale, inaccessible, or incomplete evidence remains unfocusable. `waiting` is
+  non-quiescent but its potentially sensitive `waitingFor` detail is discarded.
+
 - Discovery supports Linux procfs v1 and v2 standalone listeners plus managed v2
   central-service registration files only.
 - Bare v1 OpenCode TUI instances have no discoverable TCP listener. V1 deployment
@@ -127,6 +147,11 @@
   currently obtains one only from its own active inherited Konsole session when
   that session exposes the validated activation-cookie API. Without that source,
   fallback selection remains subject to compositor focus-stealing policy.
+- Claude focus inherits the Konsole and Kitty limitations above and additionally
+  depends on readable bounded `/proc/<pid>/environ`, stable same-UID PID/starttime
+  and TTY evidence, and exact Claude process classification. Environment or PID
+  changes between samples remove or invalidate focus; procfs revalidation is
+  repeated at Enter but remains non-atomic under the same-UID trust model.
 - Dashboard exact busy duration begins with Beacon's latest observed non-busy
   state, not the start of work inside OpenCode. An initially busy root instead
   shows how long Beacon has observed it busy as a lower bound (`> Nm`).

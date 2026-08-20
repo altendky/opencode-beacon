@@ -11,12 +11,25 @@ The repository is one publishable Cargo package with a library and binary.
   validates managed v2 registrations from OpenCode's XDG state directory.
 - `monitor` owns discovery, per-server connections, reconciliation, and
   cancellation.
+- `claude` is a default-enabled, endpoint-free provider. It polls bounded same-UID
+  per-PID live-session markers, validates PID/starttime against procfs, and
+  reduces complete scans into provider-specific lifecycle, transition,
+  attention, and projection events.
 - The binary handles Linux signals and selects the default raw event formatter,
   attention-only `watch` table, or persistent `dashboard` without changing
   monitor logic.
 - Dashboard additionally owns a Linux-only v2 TUI attachment sampler. Its
   procfs evidence and confidence remain binary-local and are not monitor events
   or shared protocol authority.
+
+The monitor owns OpenCode and Claude as sibling futures over one bounded event
+sink and cancellation root. Manual resync reaches both. Claude never enters the
+OpenCode listener, endpoint, HTTP/SSE, reconnect-generation, TUI-association, or
+cgroup-memory abstractions. CLI `--no-claude` or programmatic configuration can
+disable it without changing OpenCode monitoring. Its bounded directory scan
+yields between entries and checks shared cancellation before publishing a
+complete result. Dashboard alone uses Claude lifecycle PID/starttime as input to
+the existing binary-local client-focus evidence sampler.
 
 The watch renderer emits no startup stdout by default; `--header` writes and
 flushes one header before monitoring starts. At the binary sink it suppresses
@@ -93,7 +106,15 @@ attention occurrences, including dashboard-local ready for every fully
 quiescent known session, plus selection and scrolling. Rows have stable admission
 groups and canonical displayed-title/session ordering within each group; model
 updates restore selection by row identity after any required reorder. V1 retains its dedicated
-endpoint working-set behavior. For v2, high-confidence attached roots,
+endpoint working-set behavior.
+
+Claude dashboard rows key directly by PID/starttime, display `ATTACH=claude`,
+and reuse local ready-generation and elapsed-time behavior. They have no
+OpenCode endpoint, TUI association, or memory scope. A row gains a focus target
+only while its exact live Claude process yields fully validated Konsole or Kitty
+evidence.
+
+For v2, high-confidence attached roots,
 including idle roots, are primary; unresolved live TUIs and active executions
 without a resolved TUI are separate groups. After explicit route evidence, the
 model globally pairs remaining location-compatible TUI/root candidates only when
@@ -121,10 +142,13 @@ client-focus identifiers from a bounded environment read. Konsole uses D-Bus
 service/session/window identifiers. Kitty uses its process/window IDs and an
 absolute filesystem Unix remote-control socket, accepted only after same-UID,
 namespace, process-starttime, listener-row, and descriptor validation.
-Procfs-backed v1 instances can provide the same focus evidence directly from
-their exact process identity. The pure model emits a focus action only for a
-non-stale v1 or high-confidence attached v2 row. The binary revalidates identity
-and dispatches through a client-focus backend. For Konsole, it revalidates the
+Procfs-backed v1 instances and validated live Claude processes can provide the
+same focus evidence directly from their exact process identity. The pure model
+emits a focus action only for a non-stale v1, high-confidence attached v2, or
+non-stale Claude row with complete evidence. The binary revalidates identity and
+dispatches through a client-focus backend. Claude provenance additionally
+requires same UID, PID/starttime, TTY, exact executable identity, and unchanged
+allowlisted identifiers at every process check. For Konsole, it revalidates the
 exact retained window/tab. At Enter, it first feature-detects the
 separately built, versioned bridge tied to that window. When supported, it
 requests a fresh XDG token from Beacon's own inherited Konsole session over

@@ -13,6 +13,7 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use futures_util::StreamExt;
+use opencode_beacon::claude::{ClaudeConfig, ClaudeDiscovery};
 use opencode_beacon::client::{BasicAuth, ClientConfig};
 use opencode_beacon::discovery::{
     DiscoveryConfig, DiscoveryReport, LinuxProcfsDiscovery, ManagedDiscoveryConfig,
@@ -38,7 +39,7 @@ use memory::CgroupMemorySampler;
 const MEMORY_SAMPLE_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Parser)]
-#[command(version, about = "Monitor local OpenCode server activity")]
+#[command(version, about = "Monitor local coding-agent activity")]
 struct Args {
     #[command(subcommand)]
     command: Option<Command>,
@@ -64,6 +65,9 @@ struct Args {
     password_env: String,
     #[arg(long, global = true)]
     once: bool,
+    /// Disable monitoring of live local Claude Code CLI sessions.
+    #[arg(long, global = true)]
+    no_claude: bool,
     /// Emit diagnostics; with watch, diagnostics go to stderr only.
     #[arg(short, long, global = true, action = clap::ArgAction::Count)]
     verbose: u8,
@@ -85,6 +89,10 @@ struct WatchArgs {
 }
 
 impl Args {
+    const fn claude_enabled(&self) -> bool {
+        !self.no_claude
+    }
+
     fn validate(self) -> Result<Self, clap::Error> {
         if self.command.is_some() && self.once {
             return Err(clap::Error::raw(
@@ -455,6 +463,22 @@ fn watch_row(timestamp: &str, attention: &opencode_beacon::model::AttentionEvent
     )
 }
 
+fn claude_watch_row(
+    timestamp: &str,
+    attention: &opencode_beacon::model::ClaudeAttentionEvent,
+) -> String {
+    format!(
+        "{}  {}  {}  {}",
+        fixed_ascii(timestamp, WATCH_TIME_WIDTH),
+        minimum_width(
+            &sanitize_title(&attention.session.session_id),
+            WATCH_SESSION_WIDTH
+        ),
+        fixed_ascii(&attention.kind.to_string(), WATCH_REASON_WIDTH),
+        sanitize_title(attention.session.display_name()),
+    )
+}
+
 fn minimum_width(value: &str, width: usize) -> String {
     let character_count = value.chars().count();
     if character_count < width {
@@ -515,6 +539,9 @@ fn write_watch_event(
         BeaconEvent::Attention { attention, .. } => {
             write_line(stdout, &watch_row(timestamp, &attention))
         }
+        BeaconEvent::ClaudeAttention(attention) => {
+            write_line(stdout, &claude_watch_row(timestamp, &attention))
+        }
         BeaconEvent::Diagnostic {
             endpoint,
             message,
@@ -545,11 +572,18 @@ fn monitor_config(args: &Args, client: ClientConfig) -> MonitorConfig {
         resync_interval: args.resync_interval,
         event_capacity: args.event_capacity,
         client,
+        claude: ClaudeConfig {
+            enabled: args.claude_enabled(),
+            ..ClaudeConfig::default()
+        },
         ..MonitorConfig::default()
     }
 }
 
 async fn run_once(args: &Args, client_config: &ClientConfig) -> Result<(), Box<dyn Error>> {
+    if args.claude_enabled() {
+        print_once_claude(args.verbose > 0);
+    }
     let discovery_config = DiscoveryConfig::default();
     let discovery = LinuxProcfsDiscovery::new(discovery_config.clone());
     let managed = ManagedServiceDiscovery::new(
@@ -618,6 +652,25 @@ async fn run_once(args: &Args, client_config: &ClientConfig) -> Result<(), Box<d
         print_once_snapshot(instance.clone(), snapshot, args.verbose > 0);
     }
     Ok(())
+}
+
+fn print_once_claude(verbose: bool) {
+    match ClaudeDiscovery::new(ClaudeConfig::default()).snapshot() {
+        Ok(projections) => {
+            for projection in projections {
+                print_event(
+                    BeaconEvent::ClaudeSessionFound(projection.session.clone()),
+                    verbose,
+                );
+                print_event(BeaconEvent::ClaudeStateProjection(projection), verbose);
+            }
+        }
+        Err(error) => eprintln!(
+            "{} provider=claude snapshot_error={}",
+            timestamp(),
+            quoted(&error.to_string())
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -697,6 +750,7 @@ fn load_auth(args: &Args) -> Result<Option<BasicAuth>, Box<dyn Error>> {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn print_event(event: BeaconEvent, verbose: bool) {
     match event {
         BeaconEvent::ServerFound(instance) => println!(
@@ -760,6 +814,50 @@ fn print_event(event: BeaconEvent, verbose: bool) {
             projection.instance_key.pid,
             projection.instance_key.socket_inode,
             projection.sessions.len()
+        ),
+        BeaconEvent::ClaudeSessionFound(session) => println!(
+            "{} provider=claude pid={} start_time={} event=session_found session={} cwd={} name={}",
+            timestamp(),
+            session.key.pid,
+            session.key.start_time,
+            quoted(&session.session_id),
+            quoted(&session.cwd.to_string_lossy()),
+            quoted(session.display_name()),
+        ),
+        BeaconEvent::ClaudeSessionRemoved(session) => println!(
+            "{} provider=claude pid={} start_time={} event=session_removed session={}",
+            timestamp(),
+            session.key.pid,
+            session.key.start_time,
+            quoted(&session.session_id),
+        ),
+        BeaconEvent::ClaudeTransition(transition) => println!(
+            "{} provider=claude pid={} start_time={} session={} state={}->{}",
+            timestamp(),
+            transition.session.key.pid,
+            transition.session.key.start_time,
+            quoted(&transition.session.session_id),
+            transition.previous,
+            transition.current,
+        ),
+        BeaconEvent::ClaudeAttention(attention) => println!(
+            "{} provider=claude pid={} start_time={} event=attention attention={} session={} name={} initial={}",
+            timestamp(),
+            attention.session.key.pid,
+            attention.session.key.start_time,
+            attention.kind,
+            quoted(&attention.session.session_id),
+            quoted(attention.session.display_name()),
+            attention.initial,
+        ),
+        BeaconEvent::ClaudeStateProjection(projection) => println!(
+            "{} provider=claude pid={} start_time={} event=state_projection session={} state={} stale={}",
+            timestamp(),
+            projection.session.key.pid,
+            projection.session.key.start_time,
+            quoted(&projection.session.session_id),
+            projection.status,
+            projection.stale,
         ),
         BeaconEvent::Diagnostic {
             endpoint,
@@ -905,6 +1003,18 @@ mod tests {
         }
     }
 
+    fn claude_session_for_test() -> opencode_beacon::ClaudeSession {
+        opencode_beacon::ClaudeSession {
+            key: opencode_beacon::ClaudeSessionKey {
+                pid: 42,
+                start_time: 420,
+            },
+            session_id: "claude-session".to_owned(),
+            cwd: std::path::PathBuf::from("/workspace/claude"),
+            name: Some("Claude title".to_owned()),
+        }
+    }
+
     #[tokio::test]
     async fn managed_once_setup_failures_are_per_instance_results() {
         use std::os::unix::fs::MetadataExt;
@@ -982,6 +1092,13 @@ mod tests {
             .unwrap_or_else(|error| unreachable!("default arguments parse: {error}"));
         assert_eq!(default.command, None);
         assert!(!default.once);
+        assert!(default.claude_enabled());
+
+        let no_claude = Args::try_parse_from(["opencode-beacon", "--no-claude"])
+            .and_then(Args::validate)
+            .unwrap_or_else(|error| unreachable!("Claude opt-out arguments parse: {error}"));
+        assert!(!no_claude.claude_enabled());
+        assert!(Args::try_parse_from(["opencode-beacon", "--claude"]).is_err());
 
         let watch = Args::try_parse_from(["opencode-beacon", "watch", "--verbose"])
             .and_then(Args::validate)
@@ -991,6 +1108,13 @@ mod tests {
             Some(Command::Watch(WatchArgs { header: false }))
         );
         assert_eq!(watch.verbose, 1);
+        assert!(watch.claude_enabled());
+
+        let watch_without_claude =
+            Args::try_parse_from(["opencode-beacon", "watch", "--no-claude"])
+                .and_then(Args::validate)
+                .unwrap_or_else(|error| unreachable!("watch Claude opt-out parses: {error}"));
+        assert!(!watch_without_claude.claude_enabled());
 
         let with_header = Args::try_parse_from(["opencode-beacon", "watch", "--header"])
             .and_then(Args::validate)
@@ -1015,11 +1139,49 @@ mod tests {
             .and_then(Args::validate)
             .unwrap_or_else(|error| unreachable!("dashboard arguments parse: {error}"));
         assert_eq!(dashboard.command, Some(Command::Dashboard));
+        assert!(dashboard.claude_enabled());
         assert!(
             Args::try_parse_from(["opencode-beacon", "dashboard", "--once"])
                 .and_then(Args::validate)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn monitor_config_and_once_use_the_same_claude_default_and_opt_out() {
+        for arguments in [
+            vec!["opencode-beacon"],
+            vec!["opencode-beacon", "--once"],
+            vec!["opencode-beacon", "watch"],
+            vec!["opencode-beacon", "dashboard"],
+        ] {
+            let args = Args::try_parse_from(arguments)
+                .and_then(Args::validate)
+                .unwrap_or_else(|error| unreachable!("default mode arguments parse: {error}"));
+            assert!(args.claude_enabled());
+            assert!(
+                monitor_config(&args, ClientConfig::default())
+                    .claude
+                    .enabled
+            );
+        }
+
+        for arguments in [
+            vec!["opencode-beacon", "--no-claude"],
+            vec!["opencode-beacon", "--once", "--no-claude"],
+            vec!["opencode-beacon", "watch", "--no-claude"],
+            vec!["opencode-beacon", "dashboard", "--no-claude"],
+        ] {
+            let args = Args::try_parse_from(arguments)
+                .and_then(Args::validate)
+                .unwrap_or_else(|error| unreachable!("opt-out mode arguments parse: {error}"));
+            assert!(!args.claude_enabled());
+            assert!(
+                !monitor_config(&args, ClientConfig::default())
+                    .claude
+                    .enabled
+            );
+        }
     }
 
     #[test]
@@ -1235,6 +1397,23 @@ mod tests {
                 endpoint: endpoint_for_test(),
                 sessions: Vec::new(),
             }),
+            BeaconEvent::ClaudeSessionFound(claude_session_for_test()),
+            BeaconEvent::ClaudeSessionRemoved(claude_session_for_test()),
+            BeaconEvent::ClaudeTransition(opencode_beacon::ClaudeTransition {
+                session: claude_session_for_test(),
+                previous: opencode_beacon::ClaudeStatus::Busy,
+                current: opencode_beacon::ClaudeStatus::Idle,
+            }),
+            BeaconEvent::ClaudeAttention(opencode_beacon::ClaudeAttentionEvent {
+                kind: opencode_beacon::AttentionKind::Ready,
+                session: claude_session_for_test(),
+                initial: false,
+            }),
+            BeaconEvent::ClaudeStateProjection(opencode_beacon::ClaudeProjection {
+                session: claude_session_for_test(),
+                status: opencode_beacon::ClaudeStatus::Idle,
+                stale: false,
+            }),
             BeaconEvent::Diagnostic {
                 endpoint: Some(endpoint_for_test()),
                 message: "important diagnostic".to_owned(),
@@ -1256,8 +1435,9 @@ mod tests {
         for event in beacon_events_for_watch_test() {
             assert!(write_watch_event(&mut stdout, &mut stderr, event, false, time).is_ok());
         }
-        assert_eq!(String::from_utf8_lossy(&stdout).lines().count(), 1);
+        assert_eq!(String::from_utf8_lossy(&stdout).lines().count(), 2);
         assert!(String::from_utf8_lossy(&stdout).contains("Needs attention"));
+        assert!(String::from_utf8_lossy(&stdout).contains("Claude title"));
         assert!(stderr.is_empty());
     }
 
@@ -1271,7 +1451,7 @@ mod tests {
         }
         let stdout = String::from_utf8_lossy(&stdout);
         let stderr = String::from_utf8_lossy(&stderr);
-        assert_eq!(stdout.lines().count(), 1);
+        assert_eq!(stdout.lines().count(), 2);
         assert!(stdout.contains("Needs attention"));
         assert_eq!(stderr.lines().count(), 2);
         assert!(stderr.contains("important diagnostic"));
@@ -1321,6 +1501,35 @@ mod tests {
         assert!(output.contains("question"));
         assert!(output.contains("Startup question"));
         assert!(!output.contains("initial"));
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn claude_watch_emits_only_ready_and_sanitizes_display_fields() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut session = claude_session_for_test();
+        session.session_id = "claude\nsession".to_owned();
+        session.name = Some("title\u{1b}[31m\nnext".to_owned());
+        assert!(
+            write_watch_event(
+                &mut stdout,
+                &mut stderr,
+                BeaconEvent::ClaudeAttention(opencode_beacon::ClaudeAttentionEvent {
+                    kind: opencode_beacon::AttentionKind::Ready,
+                    session,
+                    initial: false,
+                }),
+                false,
+                "2026-08-11T16:00:00Z",
+            )
+            .is_ok()
+        );
+        let output = String::from_utf8_lossy(&stdout);
+        assert_eq!(output.lines().count(), 1);
+        assert!(output.contains("claude session"));
+        assert!(output.contains("title [31m next"));
+        assert!(!output.contains('\u{1b}'));
         assert!(stderr.is_empty());
     }
 

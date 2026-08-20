@@ -244,6 +244,79 @@ pub struct ServerProjection {
     pub sessions: Vec<ProjectedSession>,
 }
 
+/// Stable identity for one live Claude Code process.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ClaudeSessionKey {
+    pub pid: u32,
+    pub start_time: u64,
+}
+
+/// Privacy-limited metadata for one validated Claude Code session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClaudeSession {
+    pub key: ClaudeSessionKey,
+    pub session_id: String,
+    pub cwd: PathBuf,
+    pub name: Option<String>,
+}
+
+impl ClaudeSession {
+    /// Returns the configured name, cwd basename, then session ID.
+    #[must_use]
+    pub fn display_name(&self) -> &str {
+        self.name
+            .as_deref()
+            .filter(|name| !name.is_empty())
+            .or_else(|| self.cwd.file_name().and_then(|name| name.to_str()))
+            .filter(|name| !name.is_empty())
+            .unwrap_or(&self.session_id)
+    }
+}
+
+/// Normalized activity reported by a Claude Code live-session marker.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClaudeStatus {
+    Busy,
+    Waiting,
+    Idle,
+    Unknown,
+}
+
+impl fmt::Display for ClaudeStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Busy => "busy",
+            Self::Waiting => "waiting",
+            Self::Idle => "idle",
+            Self::Unknown => "unknown",
+        })
+    }
+}
+
+/// A Claude Code session status change.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClaudeTransition {
+    pub session: ClaudeSession,
+    pub previous: ClaudeStatus,
+    pub current: ClaudeStatus,
+}
+
+/// Current privacy-limited state for one Claude Code session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClaudeProjection {
+    pub session: ClaudeSession,
+    pub status: ClaudeStatus,
+    pub stale: bool,
+}
+
+/// A user-facing attention occurrence for one Claude Code session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClaudeAttentionEvent {
+    pub kind: AttentionKind,
+    pub session: ClaudeSession,
+    pub initial: bool,
+}
+
 /// Health response from `OpenCode`.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct Health {
@@ -366,6 +439,11 @@ pub enum BeaconEvent {
         attention: AttentionEvent,
     },
     StateProjection(ServerProjection),
+    ClaudeSessionFound(ClaudeSession),
+    ClaudeSessionRemoved(ClaudeSession),
+    ClaudeTransition(ClaudeTransition),
+    ClaudeAttention(ClaudeAttentionEvent),
+    ClaudeStateProjection(ClaudeProjection),
     Diagnostic {
         endpoint: Option<ServerEndpoint>,
         message: String,

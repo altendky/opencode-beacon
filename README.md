@@ -1,8 +1,26 @@
 # opencode-beacon
 
-`opencode-beacon` discovers local OpenCode HTTP servers and prints session
-activity as concise line-oriented output.
+`opencode-beacon` discovers local OpenCode HTTP servers and Claude Code CLI
+sessions, then prints activity as concise line-oriented output.
 It is a Linux-first event-detection MVP with a reusable Rust library.
+
+Claude Code CLI monitoring is included by default as a sibling provider in raw,
+watch, dashboard, and once modes. OpenCode monitoring remains enabled alongside
+it. To disable Claude monitoring for one invocation:
+
+```console
+opencode-beacon --no-claude
+opencode-beacon watch --no-claude
+opencode-beacon dashboard --no-claude
+opencode-beacon --once --no-claude
+```
+
+By default Beacon polls Claude Code's bounded per-PID live-session markers and
+validates each marker against a same-UID `claude` process and stable Linux PID
+starttime. Initial idle
+does not emit raw/watch ready attention; after observed busy or waiting activity,
+the next idle state emits one ready occurrence. Dashboard locally admits an
+initially idle Claude row as dismissible generation-zero ready.
 
 ```console
 $ opencode-beacon
@@ -106,9 +124,12 @@ until that history exists. Samples are retained in memory for at most two hours.
 Sampling continues through SSE disconnect and stops only on exact removal or
 replacement. A managed v2 service PID is shared transport infrastructure, not a
 TUI, so managed rows show `N/A` rather than misattribute service memory.
+Claude rows likewise show `N/A`: the Claude provider does not attribute cgroup
+memory or participate in OpenCode TUI attachment. Focus is available separately
+when the exact Claude process supplies validated Konsole or Kitty evidence.
 
-Use Up/Down or `j`/`k` to move, Enter to request focus for the selected attached
-TUI, Right to dismiss the selected active attention occurrence locally, Left to
+Use Up/Down or `j`/`k` to move, Enter to request focus for the selected supported
+row, Right to dismiss the selected active attention occurrence locally, Left to
 restore it, and `q` or Ctrl-C to exit. `d` remains unbound. Dismissal and focus
 never mutate an OpenCode session. Active attention is
 left-aligned in `STATE`; dismissed attention keeps its semantic color, becomes
@@ -262,6 +283,19 @@ same behavior with `MonitorConfig::discovery_interval` and
 `MonitorConfig::full_verification_interval`.
 The event-response header wait has its own timeout; the established SSE body is
 not subject to the ordinary request timeout.
+
+Claude monitoring is read-only and Linux-local. It honors `CLAUDE_CONFIG_DIR`,
+falling back to `$HOME/.claude`, and reads only regular current-UID marker files
+up to 64 KiB plus the matching process's bounded identity metadata. It retains
+only PID/starttime, session ID, cwd, optional name, and normalized status. It
+does not read transcripts under `~/.claude/projects`, install hooks, run
+`claude agents`, invoke session control, access the network, or attribute memory.
+Dashboard focus may read at most 256 KiB of an exact stable same-UID Claude
+process environment, retaining only strict Konsole/Kitty identifiers. A Claude
+row can focus through the same validated Konsole or Kitty path as OpenCode;
+headless, stale, changed, or incomplete evidence remains unfocusable. Session
+IDs, paths, and names can still be sensitive and should be protected like
+OpenCode titles.
 
 ## Activity Model
 

@@ -38,6 +38,30 @@ cargo test --locked two_completed_full_misses
 cargo test --locked disconnect_records_generation
 ```
 
+Focused Claude-provider verification:
+
+```console
+cargo test --locked claude_
+cargo test --locked initial_idle_is_silent_until_work_arms_ready
+cargo test --locked successful_misses_remove_on_second_pass_but_failures_only_mark_stale
+cargo test --locked pid_reuse_has_distinct_identity
+cargo test --locked claude_provider_resyncs_and_stops_with_shared_cancellation
+```
+
+Synthetic Claude tests use temporary config and procfs roots and cover exact
+process classification, same UID, PID/starttime identity, tolerant status
+normalization, initial-idle ready suppression, stale retention, two-miss
+removal, ordered PID reuse, shared cancellation/resync, watch sanitization, and
+dashboard generation-zero ready, unknown rendering, and stale elapsed-time
+freezing. Claude focus tests cover bounded allowlisted Konsole and fully
+validated Kitty evidence, headless/missing identifiers, same UID, exact process
+classification, PID reuse, changed identifiers, stale rows, and pre-command
+revalidation. CLI tests cover default enablement and `--no-claude` across raw,
+once, watch, and dashboard modes, while library tests retain explicit
+programmatic disable coverage. Live acceptance must use an isolated Claude
+2.1.160 session and remain observational. It must not open transcripts, install
+hooks, invoke control commands, or submit prompts merely to drive a test.
+
 Tests keep protocol parsing and state reduction independent from live servers.
 Use mocks for event generation, failed snapshots, backpressure, reconnect, and
 session-control scenarios.

@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use opencode_beacon::model::{
-    AttentionKind, BeaconEvent, InstanceKey, OpenCodeProtocol, ProjectedSession, ProjectedStatus,
-    ServerEndpoint, ServerProjection,
+    AttentionKind, BeaconEvent, ClaudeProjection, ClaudeSessionKey, ClaudeStatus, InstanceKey,
+    OpenCodeProtocol, ProjectedSession, ProjectedStatus, ServerEndpoint, ServerProjection,
 };
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
@@ -27,9 +27,37 @@ const MAX_ELAPSED_MINUTES: u64 = 9_999_999;
 const MINUTE: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct RowKey {
-    instance: InstanceKey,
-    root_session_id: String,
+enum RowKey {
+    OpenCode {
+        instance: InstanceKey,
+        root_session_id: String,
+    },
+    Claude(ClaudeSessionKey),
+}
+
+impl RowKey {
+    const fn opencode(instance: InstanceKey, root_session_id: String) -> Self {
+        Self::OpenCode {
+            instance,
+            root_session_id,
+        }
+    }
+
+    const fn instance(&self) -> Option<&InstanceKey> {
+        match self {
+            Self::OpenCode { instance, .. } => Some(instance),
+            Self::Claude(_) => None,
+        }
+    }
+
+    fn session_id<'a>(&'a self, claude_id: &'a str) -> &'a str {
+        match self {
+            Self::OpenCode {
+                root_session_id, ..
+            } => root_session_id,
+            Self::Claude(_) => claude_id,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -43,7 +71,8 @@ enum Occurrence {
 #[allow(clippy::struct_excessive_bools)]
 struct DashboardRow {
     key: RowKey,
-    endpoint: ServerEndpoint,
+    endpoint: Option<ServerEndpoint>,
+    session_id: String,
     title: String,
     slug: String,
     busy: bool,
@@ -51,6 +80,7 @@ struct DashboardRow {
     background_count: usize,
     question_ids: Vec<String>,
     permission_ids: Vec<String>,
+    ready_eligible: bool,
     ready_generation: u64,
     stale: bool,
     attachment_stale: bool,
@@ -70,6 +100,7 @@ enum RowCategory {
     Headless,
     Ambiguous,
     Unresolved,
+    Claude,
 }
 
 impl RowCategory {
@@ -80,11 +111,12 @@ impl RowCategory {
             Self::Headless => "headless",
             Self::Ambiguous => "ambiguous",
             Self::Unresolved => "unresolved",
+            Self::Claude => "claude",
         }
     }
 
     const fn has_session_state(self) -> bool {
-        matches!(self, Self::Attached | Self::Headless)
+        matches!(self, Self::Attached | Self::Headless | Self::Claude)
     }
 }
 
@@ -103,10 +135,15 @@ impl DashboardRow {
             Some(Occurrence::Permission(self.permission_ids.clone()))
         } else if self.busy || self.background_count > 0 {
             None
-        } else if matches!(
-            self.category,
-            RowCategory::V1 | RowCategory::Attached | RowCategory::Headless
-        ) {
+        } else if self.ready_eligible
+            && matches!(
+                self.category,
+                RowCategory::V1
+                    | RowCategory::Attached
+                    | RowCategory::Headless
+                    | RowCategory::Claude
+            )
+        {
             Some(Occurrence::Ready(self.ready_generation))
         } else {
             None
@@ -137,7 +174,7 @@ impl DashboardRow {
         } else if !self.slug.is_empty() {
             &self.slug
         } else {
-            &self.key.root_session_id
+            self.key.session_id(&self.session_id)
         }
     }
 
@@ -239,6 +276,16 @@ impl DashboardModel {
                 }
             }
             BeaconEvent::StateProjection(projection) => self.apply_projection(&projection, now),
+            BeaconEvent::ClaudeSessionRemoved(session) => {
+                self.rows
+                    .retain(|row| row.key != RowKey::Claude(session.key));
+            }
+            BeaconEvent::ClaudeStateProjection(projection) => {
+                self.apply_claude_projection(&projection, now);
+            }
+            BeaconEvent::ClaudeAttention(attention) if attention.kind == AttentionKind::Ready => {
+                self.apply_claude_ready(attention.session.key, now);
+            }
             BeaconEvent::Attention {
                 endpoint,
                 attention,
@@ -269,8 +316,20 @@ impl DashboardModel {
         let selected_key = self.selected_key();
         self.v1_focus = snapshot.v1_focus;
         for row in &mut self.rows {
-            if row.category == RowCategory::V1 {
-                row.focus = self.v1_focus.get(&row.key.instance).cloned();
+            match &row.key {
+                RowKey::OpenCode { instance, .. } if row.category == RowCategory::V1 => {
+                    row.focus = self.v1_focus.get(instance).cloned();
+                }
+                RowKey::Claude(key) => {
+                    row.focus = snapshot
+                        .claude_focus
+                        .get(&TuiKey {
+                            pid: key.pid,
+                            start_time: key.start_time,
+                        })
+                        .cloned();
+                }
+                RowKey::OpenCode { .. } => {}
             }
         }
         self.attachments.clear();
@@ -325,17 +384,12 @@ impl DashboardModel {
                 .map(|aggregate| aggregate.id.as_str())
                 .collect::<HashSet<_>>();
             self.last_non_busy.retain(|key, _| {
-                key.instance != instance || root_ids.contains(key.root_session_id.as_str())
+                key.instance() != Some(&instance) || root_ids.contains(key.session_id(""))
             });
             for aggregate in aggregates {
                 if !aggregate.busy {
-                    self.last_non_busy.insert(
-                        RowKey {
-                            instance: instance.clone(),
-                            root_session_id: aggregate.id,
-                        },
-                        now,
-                    );
+                    self.last_non_busy
+                        .insert(RowKey::opencode(instance.clone(), aggregate.id), now);
                 }
             }
             self.rebuild_v2_rows(&instance, now);
@@ -353,18 +407,15 @@ impl DashboardModel {
             .map(|aggregate| aggregate.id.as_str())
             .collect::<HashSet<_>>();
         self.rows.retain(|row| {
-            row.key.instance != instance
-                || (session_ids.contains(row.key.root_session_id.as_str())
-                    && root_ids.contains(row.key.root_session_id.as_str()))
+            row.key.instance() != Some(&instance)
+                || (session_ids.contains(row.key.session_id(""))
+                    && root_ids.contains(row.key.session_id("")))
         });
         self.last_non_busy.retain(|key, _| {
-            key.instance != instance || root_ids.contains(key.root_session_id.as_str())
+            key.instance() != Some(&instance) || root_ids.contains(key.session_id(""))
         });
         for aggregate in aggregates {
-            let key = RowKey {
-                instance: instance.clone(),
-                root_session_id: aggregate.id.clone(),
-            };
+            let key = RowKey::opencode(instance.clone(), aggregate.id.clone());
             if !aggregate.busy {
                 self.last_non_busy.insert(key.clone(), now);
             }
@@ -386,19 +437,19 @@ impl DashboardModel {
         for row in self
             .rows
             .iter_mut()
-            .filter(|row| row.key.instance == instance && row.category == RowCategory::V1)
+            .filter(|row| row.key.instance() == Some(&instance) && row.category == RowCategory::V1)
         {
             row.focus = self.v1_focus.get(&instance).cloned();
         }
         let ready = self
             .pending_ready
             .iter()
-            .filter(|key| key.instance == instance)
+            .filter(|key| key.instance() == Some(&instance))
             .cloned()
             .collect::<Vec<_>>();
         for key in ready {
             self.pending_ready.remove(&key);
-            self.apply_ready(&instance, projection.endpoint, &key.root_session_id, now);
+            self.apply_ready(&instance, projection.endpoint, key.session_id(""), now);
         }
         self.set_stale(&instance, false, now);
     }
@@ -410,10 +461,7 @@ impl DashboardModel {
         root_id: &str,
         now: Instant,
     ) {
-        let key = RowKey {
-            instance: instance.clone(),
-            root_session_id: root_id.to_owned(),
-        };
+        let key = RowKey::opencode(instance.clone(), root_id.to_owned());
         self.last_non_busy.insert(key.clone(), now);
         if let Some(row) = self.rows.iter_mut().find(|row| row.key == key) {
             row.ready_generation = row.ready_generation.saturating_add(1);
@@ -439,7 +487,8 @@ impl DashboardModel {
         };
         self.rows.push(DashboardRow {
             key,
-            endpoint,
+            endpoint: Some(endpoint),
+            session_id: root_id.to_owned(),
             title: session.title.clone(),
             slug: session.slug.clone(),
             busy: false,
@@ -447,6 +496,7 @@ impl DashboardModel {
             background_count: 0,
             question_ids: Vec::new(),
             permission_ids: Vec::new(),
+            ready_eligible: true,
             ready_generation: 1,
             stale: false,
             attachment_stale: false,
@@ -461,7 +511,7 @@ impl DashboardModel {
     }
 
     fn remove_instance(&mut self, instance: &InstanceKey) {
-        self.rows.retain(|row| &row.key.instance != instance);
+        self.rows.retain(|row| row.key.instance() != Some(instance));
         self.projections.remove(instance);
         self.attachments.remove(instance);
         self.v1_focus.remove(instance);
@@ -470,10 +520,98 @@ impl DashboardModel {
         self.connected.remove(instance);
         self.memory.remove(instance);
         self.last_non_busy
-            .retain(|key, _| &key.instance != instance);
-        self.pending_ready.retain(|key| &key.instance != instance);
+            .retain(|key, _| key.instance() != Some(instance));
+        self.pending_ready
+            .retain(|key| key.instance() != Some(instance));
         self.endpoint_instances.retain(|_, value| value != instance);
         self.v2_instances.remove(instance);
+    }
+
+    fn apply_claude_projection(&mut self, projection: &ClaudeProjection, now: Instant) {
+        let key = RowKey::Claude(projection.session.key);
+        let busy = matches!(
+            projection.status,
+            ClaudeStatus::Busy | ClaudeStatus::Waiting
+        );
+        if let Some(row) = self.rows.iter_mut().find(|row| row.key == key) {
+            let previous = row.occurrence();
+            let was_busy = row.busy;
+            let was_stale = row.stale;
+            if projection.stale && !was_stale && row.frozen_busy_elapsed.is_none() {
+                row.frozen_busy_elapsed = row.busy_elapsed(now);
+            }
+            row.session_id.clone_from(&projection.session.session_id);
+            projection.session.display_name().clone_into(&mut row.title);
+            row.slug.clear();
+            row.busy = busy;
+            row.ready_eligible = projection.status == ClaudeStatus::Idle;
+            row.stale = projection.stale;
+            if busy {
+                if !projection.stale
+                    && (was_stale || row.frozen_busy_elapsed.is_some())
+                    && let Some(elapsed) = row.frozen_busy_elapsed
+                {
+                    if row.last_non_busy.is_some() {
+                        row.last_non_busy = now.checked_sub(elapsed);
+                    } else if row.first_busy_observed.is_some() {
+                        row.first_busy_observed = now.checked_sub(elapsed);
+                    }
+                } else if !was_busy && row.last_non_busy.is_none() {
+                    row.first_busy_observed = Some(now);
+                }
+                if !projection.stale {
+                    row.frozen_busy_elapsed = None;
+                }
+                row.dismissed = None;
+            } else if projection.status == ClaudeStatus::Idle && !projection.stale {
+                row.last_non_busy = Some(now);
+                row.first_busy_observed = None;
+                row.frozen_busy_elapsed = None;
+            }
+            if previous != row.occurrence() {
+                row.dismissed = None;
+            }
+            return;
+        }
+        self.rows.push(DashboardRow {
+            key,
+            endpoint: None,
+            session_id: projection.session.session_id.clone(),
+            title: projection.session.display_name().to_owned(),
+            slug: String::new(),
+            busy,
+            retry: false,
+            background_count: 0,
+            question_ids: Vec::new(),
+            permission_ids: Vec::new(),
+            ready_eligible: projection.status == ClaudeStatus::Idle,
+            ready_generation: 0,
+            stale: projection.stale,
+            attachment_stale: false,
+            last_non_busy: (!busy && projection.status == ClaudeStatus::Idle).then_some(now),
+            first_busy_observed: busy.then_some(now),
+            frozen_busy_elapsed: None,
+            dismissed: None,
+            category: RowCategory::Claude,
+            tui: None,
+            focus: None,
+        });
+    }
+
+    fn apply_claude_ready(&mut self, key: ClaudeSessionKey, now: Instant) {
+        if let Some(row) = self
+            .rows
+            .iter_mut()
+            .find(|row| row.key == RowKey::Claude(key))
+        {
+            row.ready_generation = row.ready_generation.saturating_add(1);
+            row.busy = false;
+            row.ready_eligible = true;
+            row.last_non_busy = Some(now);
+            row.first_busy_observed = None;
+            row.frozen_busy_elapsed = None;
+            row.dismissed = None;
+        }
     }
 
     #[allow(clippy::too_many_lines)]
@@ -481,10 +619,10 @@ impl DashboardModel {
         let mut previous = self
             .rows
             .iter()
-            .filter(|row| &row.key.instance == instance)
+            .filter(|row| row.key.instance() == Some(instance))
             .map(|row| (row.key.clone(), row.clone()))
             .collect::<HashMap<_, _>>();
-        self.rows.retain(|row| &row.key.instance != instance);
+        self.rows.retain(|row| row.key.instance() != Some(instance));
         let Some(projection) = self.projections.get(instance) else {
             return;
         };
@@ -509,10 +647,7 @@ impl DashboardModel {
                         continue;
                     };
                     if attached.insert(root_id.clone()) {
-                        let key = RowKey {
-                            instance: instance.clone(),
-                            root_session_id: root_id,
-                        };
+                        let key = RowKey::opencode(instance.clone(), root_id);
                         let mut row = previous.remove(&key).map_or_else(
                             || {
                                 new_row(
@@ -544,10 +679,7 @@ impl DashboardModel {
             if (aggregate.busy || aggregate.background_count > 0)
                 && !attached.contains(&aggregate.id)
             {
-                let key = RowKey {
-                    instance: instance.clone(),
-                    root_session_id: aggregate.id.clone(),
-                };
+                let key = RowKey::opencode(instance.clone(), aggregate.id.clone());
                 let mut row = previous.remove(&key).map_or_else(
                     || {
                         new_row(
@@ -577,11 +709,9 @@ impl DashboardModel {
                 |hint| format!("{} (possible {hint})", tui.cwd.display()),
             );
             self.rows.push(DashboardRow {
-                key: RowKey {
-                    instance: instance.clone(),
-                    root_session_id: id,
-                },
-                endpoint: projection.endpoint,
+                key: RowKey::opencode(instance.clone(), id.clone()),
+                endpoint: Some(projection.endpoint),
+                session_id: id,
                 title,
                 slug: String::new(),
                 busy: false,
@@ -589,6 +719,7 @@ impl DashboardModel {
                 background_count: 0,
                 question_ids: Vec::new(),
                 permission_ids: Vec::new(),
+                ready_eligible: false,
                 ready_generation: 0,
                 stale: false,
                 attachment_stale: tui.stale,
@@ -611,7 +742,7 @@ impl DashboardModel {
         for row in self
             .rows
             .iter_mut()
-            .filter(|row| &row.key.instance == instance)
+            .filter(|row| row.key.instance() == Some(instance))
         {
             if stale && !row.stale && row.frozen_busy_elapsed.is_none() {
                 row.frozen_busy_elapsed = row.busy_elapsed(now);
@@ -770,8 +901,15 @@ impl DashboardModel {
             RowCategory::Headless => Some("no attached TUI"),
             RowCategory::Ambiguous => Some("TUI association is ambiguous"),
             RowCategory::Unresolved => Some("TUI association is unresolved"),
+            RowCategory::Claude if row.is_stale() => Some("Claude process evidence is stale"),
+            RowCategory::Claude if row.focus.is_none() => {
+                Some("validated terminal focus evidence is unavailable")
+            }
             RowCategory::V1 | RowCategory::Attached
-                if !self.connected.contains(&row.key.instance) =>
+                if !row
+                    .key
+                    .instance()
+                    .is_some_and(|instance| self.connected.contains(instance)) =>
             {
                 Some("server is disconnected")
             }
@@ -781,7 +919,7 @@ impl DashboardModel {
             RowCategory::V1 | RowCategory::Attached if row.focus.is_none() => {
                 Some("client focus identifiers are unavailable")
             }
-            RowCategory::V1 | RowCategory::Attached => None,
+            RowCategory::Claude | RowCategory::V1 | RowCategory::Attached => None,
         };
         if let Some(reason) = unavailable {
             self.set_action_status(format!("Cannot focus {name}: {reason}"));
@@ -864,16 +1002,27 @@ impl DashboardModel {
                     Modifier::empty()
                 });
             let state = state_line(row, row.marker(), attention_style, now);
-            let session = if endpoint_duplicates.contains(&row.key.root_session_id) {
-                format!("{} @{}", row.key.root_session_id, row.endpoint)
+            let session_id = row.key.session_id(&row.session_id);
+            let session = if endpoint_duplicates.contains(session_id) {
+                format!(
+                    "{} @{}",
+                    session_id,
+                    row.endpoint
+                        .map_or_else(|| "-".to_owned(), |endpoint| endpoint.to_string())
+                )
             } else {
-                row.key.root_session_id.clone()
+                session_id.to_owned()
             };
-            let memory = if rendered_instances.insert(row.key.instance.clone()) {
-                memory_cell(self.memory.get(&row.key.instance))
-            } else {
-                Line::default()
-            };
+            let memory = row.key.instance().map_or_else(
+                || memory_cell(None),
+                |instance| {
+                    if rendered_instances.insert(instance.clone()) {
+                        memory_cell(self.memory.get(instance))
+                    } else {
+                        Line::default()
+                    }
+                },
+            );
             Row::new([
                 Cell::from(sanitize(&session)),
                 Cell::from(row.category.label()),
@@ -938,7 +1087,11 @@ impl DashboardModel {
         let Some(row) = self.selected.and_then(|selected| self.rows.get(selected)) else {
             return "MEM N/A".to_owned();
         };
-        let Some(memory) = self.memory.get(&row.key.instance) else {
+        let Some(memory) = row
+            .key
+            .instance()
+            .and_then(|instance| self.memory.get(instance))
+        else {
             return "MEM N/A".to_owned();
         };
         let availability = match memory.availability {
@@ -981,7 +1134,11 @@ impl DashboardModel {
                     && !row.is_stale()
                     && row.frozen_busy_elapsed.is_none()
                     && row.occurrence().is_none()
-                    && self.connected.contains(&row.key.instance)
+                    && (row.category == RowCategory::Claude
+                        || row
+                            .key
+                            .instance()
+                            .is_some_and(|instance| self.connected.contains(instance)))
             })
             .filter_map(|row| {
                 let baseline = row.busy_baseline()?;
@@ -1001,8 +1158,22 @@ fn compare_rows(left: &DashboardRow, right: &DashboardRow) -> Ordering {
     row_group(left.category)
         .cmp(&row_group(right.category))
         .then_with(|| sanitize(left.name()).cmp(&sanitize(right.name())))
-        .then_with(|| left.key.root_session_id.cmp(&right.key.root_session_id))
-        .then_with(|| left.endpoint.address().cmp(&right.endpoint.address()))
+        .then_with(|| {
+            left.key
+                .session_id(&left.session_id)
+                .cmp(right.key.session_id(&right.session_id))
+        })
+        .then_with(|| {
+            left.endpoint
+                .map(ServerEndpoint::address)
+                .cmp(&right.endpoint.map(ServerEndpoint::address))
+        })
+        .then_with(|| match (&left.key, &right.key) {
+            (RowKey::Claude(left), RowKey::Claude(right)) => {
+                (left.pid, left.start_time).cmp(&(right.pid, right.start_time))
+            }
+            _ => Ordering::Equal,
+        })
 }
 
 const fn row_group(category: RowCategory) -> u8 {
@@ -1010,7 +1181,8 @@ const fn row_group(category: RowCategory) -> u8 {
         RowCategory::V1 => 0,
         RowCategory::Attached => 1,
         RowCategory::Headless => 2,
-        RowCategory::Ambiguous | RowCategory::Unresolved => 3,
+        RowCategory::Claude => 3,
+        RowCategory::Ambiguous | RowCategory::Unresolved => 4,
     }
 }
 
@@ -1175,7 +1347,7 @@ fn update_row(
     let previous = row.occurrence();
     let was_stale = row.stale;
     let was_busy = row.busy;
-    row.endpoint = endpoint;
+    row.endpoint = Some(endpoint);
     row.title.clone_from(&aggregate.title);
     row.slug.clone_from(&aggregate.slug);
     row.busy = aggregate.busy;
@@ -1216,7 +1388,8 @@ fn new_row(
 ) -> DashboardRow {
     DashboardRow {
         key,
-        endpoint,
+        endpoint: Some(endpoint),
+        session_id: aggregate.id.clone(),
         title: aggregate.title.clone(),
         slug: aggregate.slug.clone(),
         busy: aggregate.busy,
@@ -1224,6 +1397,7 @@ fn new_row(
         background_count: aggregate.background_count,
         question_ids: aggregate.question_ids.clone(),
         permission_ids: aggregate.permission_ids.clone(),
+        ready_eligible: true,
         ready_generation: 0,
         stale: false,
         attachment_stale: false,
@@ -1567,6 +1741,14 @@ fn state_line(
     marker_style: Style,
     now: Instant,
 ) -> Line<'static> {
+    if row.category == RowCategory::Claude && !row.busy && row.occurrence().is_none() {
+        let state = if row.is_stale() {
+            "stale unknown"
+        } else {
+            "unknown"
+        };
+        return Line::styled(state, Style::default().fg(Color::DarkGray));
+    }
     if row.category.has_session_state()
         && row.occurrence().is_none()
         && (!row.busy || row.background_count > 0)
@@ -1661,10 +1843,12 @@ fn occurrence_color(occurrence: &Occurrence) -> Style {
 fn endpoint_duplicate_sessions(rows: &[DashboardRow]) -> HashSet<String> {
     let mut endpoints = HashMap::<&str, HashSet<ServerEndpoint>>::new();
     for row in rows {
-        endpoints
-            .entry(&row.key.root_session_id)
-            .or_default()
-            .insert(row.endpoint);
+        if let (Some(_), Some(endpoint)) = (row.key.instance(), row.endpoint) {
+            endpoints
+                .entry(row.key.session_id(&row.session_id))
+                .or_default()
+                .insert(endpoint);
+        }
     }
     endpoints
         .into_iter()
@@ -1695,6 +1879,215 @@ mod tests {
 
     use super::*;
     use opencode_beacon::model::{AttentionEvent, InstanceSource, TransitionSource};
+
+    fn claude_projection(status: ClaudeStatus, stale: bool) -> BeaconEvent {
+        BeaconEvent::ClaudeStateProjection(ClaudeProjection {
+            session: opencode_beacon::ClaudeSession {
+                key: ClaudeSessionKey {
+                    pid: 700,
+                    start_time: 9000,
+                },
+                session_id: "claude-session".to_owned(),
+                cwd: PathBuf::from("/workspace/claude-project"),
+                name: Some("Claude project".to_owned()),
+            },
+            status,
+            stale,
+        })
+    }
+
+    #[test]
+    fn claude_initial_idle_focus_requires_fresh_validated_konsole_or_kitty_evidence() {
+        let mut model = DashboardModel::default();
+        let now = Instant::now();
+        model.apply_at(claude_projection(ClaudeStatus::Idle, false), now);
+
+        assert_eq!(model.rows.len(), 1);
+        assert_eq!(model.rows[0].category, RowCategory::Claude);
+        assert_eq!(model.rows[0].occurrence(), Some(Occurrence::Ready(0)));
+        assert_eq!(
+            memory_cell(
+                model.rows[0]
+                    .key
+                    .instance()
+                    .and_then(|key| model.memory.get(key))
+            )
+            .to_string(),
+            "N/A"
+        );
+        assert_eq!(
+            model.handle_terminal_event(&key_event(KeyCode::Enter), 5),
+            DashboardAction::Redraw
+        );
+        assert_eq!(
+            model
+                .dismissal_status
+                .as_ref()
+                .map(|status| status.message.as_str()),
+            Some("Cannot focus Claude project: validated terminal focus evidence is unavailable")
+        );
+
+        let process = TuiKey {
+            pid: 700,
+            start_time: 9000,
+        };
+        let konsole = FocusTarget {
+            process,
+            source: crate::attachment::FocusProcessSource::Claude,
+            client: crate::attachment::ClientFocusTarget::Konsole(
+                crate::attachment::KonsoleTarget {
+                    service: ":1.108".to_owned(),
+                    session_path: "/Sessions/4".to_owned(),
+                    window_path: "/Windows/9".to_owned(),
+                },
+            ),
+        };
+        model.apply_attachments(
+            AttachmentSnapshot {
+                claude_focus: HashMap::from([(process, konsole.clone())]),
+                ..AttachmentSnapshot::default()
+            },
+            now,
+        );
+        assert_eq!(
+            model.handle_terminal_event(&key_event(KeyCode::Enter), 5),
+            DashboardAction::Focus(FocusRequest {
+                target: konsole,
+                name: "Claude project".to_owned(),
+            })
+        );
+
+        let kitty = FocusTarget {
+            process,
+            source: crate::attachment::FocusProcessSource::Claude,
+            client: crate::attachment::ClientFocusTarget::Kitty(crate::attachment::KittyTarget {
+                process: TuiKey {
+                    pid: 500,
+                    start_time: 8000,
+                },
+                window_id: 7,
+                socket_path: PathBuf::from("/run/user/1000/kitty-500"),
+                socket_device: 1,
+                socket_inode: 2,
+            }),
+        };
+        model.apply_attachments(
+            AttachmentSnapshot {
+                claude_focus: HashMap::from([(process, kitty.clone())]),
+                ..AttachmentSnapshot::default()
+            },
+            now,
+        );
+        assert_eq!(
+            model.handle_terminal_event(&key_event(KeyCode::Enter), 5),
+            DashboardAction::Focus(FocusRequest {
+                target: kitty,
+                name: "Claude project".to_owned(),
+            })
+        );
+
+        model.apply_at(claude_projection(ClaudeStatus::Idle, true), now);
+        assert_eq!(
+            model.handle_terminal_event(&key_event(KeyCode::Enter), 5),
+            DashboardAction::Redraw
+        );
+        assert_eq!(
+            model
+                .dismissal_status
+                .as_ref()
+                .map(|status| status.message.as_str()),
+            Some("Cannot focus Claude project: Claude process evidence is stale")
+        );
+    }
+
+    #[test]
+    fn claude_unknown_never_claims_ready_and_live_ready_advances_generation() {
+        let mut model = DashboardModel::default();
+        let now = Instant::now();
+        model.apply_at(claude_projection(ClaudeStatus::Unknown, false), now);
+        assert_eq!(model.rows[0].occurrence(), None);
+        let screenshot = format!("{:?}", rendered(&mut model, 140, 8));
+        assert!(screenshot.contains("unknown"));
+        assert!(!screenshot.contains("background 0"));
+
+        model.apply_at(claude_projection(ClaudeStatus::Busy, false), now);
+        assert!(model.rows[0].busy);
+        model.apply_at(
+            BeaconEvent::ClaudeAttention(opencode_beacon::ClaudeAttentionEvent {
+                kind: AttentionKind::Ready,
+                session: match claude_projection(ClaudeStatus::Idle, false) {
+                    BeaconEvent::ClaudeStateProjection(projection) => projection.session,
+                    _ => unreachable!("fixture is a Claude projection"),
+                },
+                initial: false,
+            }),
+            now,
+        );
+        assert_eq!(model.rows[0].occurrence(), Some(Occurrence::Ready(1)));
+        model.apply_at(claude_projection(ClaudeStatus::Idle, false), now);
+        assert_eq!(model.rows[0].occurrence(), Some(Occurrence::Ready(1)));
+    }
+
+    #[test]
+    fn claude_stale_busy_elapsed_freezes_and_resumes_without_stale_time() {
+        let mut model = DashboardModel::default();
+        let start = Instant::now();
+        model.apply_at(claude_projection(ClaudeStatus::Busy, false), start);
+        model.apply_at(
+            claude_projection(ClaudeStatus::Busy, true),
+            start + Duration::from_secs(30),
+        );
+        assert_eq!(
+            model.rows[0].busy_elapsed(start + Duration::from_secs(90)),
+            Some(Duration::from_secs(30))
+        );
+
+        model.apply_at(
+            claude_projection(ClaudeStatus::Busy, false),
+            start + Duration::from_secs(120),
+        );
+        assert_eq!(
+            model.rows[0].busy_elapsed(start + Duration::from_secs(120)),
+            Some(Duration::from_secs(30))
+        );
+        assert!(model.rows[0].frozen_busy_elapsed.is_none());
+    }
+
+    #[test]
+    fn claude_rows_use_identity_for_order_and_removal_clears_dismissal() {
+        let mut model = DashboardModel::default();
+        let now = Instant::now();
+        let BeaconEvent::ClaudeStateProjection(mut second) =
+            claude_projection(ClaudeStatus::Idle, false)
+        else {
+            unreachable!("fixture is a Claude projection");
+        };
+        second.session.key.pid = 701;
+        model.apply_at(BeaconEvent::ClaudeStateProjection(second), now);
+        model.apply_at(claude_projection(ClaudeStatus::Idle, false), now);
+        assert_eq!(
+            model
+                .rows
+                .iter()
+                .map(|row| match row.key {
+                    RowKey::Claude(key) => key.pid,
+                    RowKey::OpenCode { .. } => 0,
+                })
+                .collect::<Vec<_>>(),
+            [700, 701]
+        );
+
+        model.handle_terminal_event(&key_event(KeyCode::Up), 5);
+        model.handle_terminal_event(&key_event(KeyCode::Right), 5);
+        assert!(model.rows[0].dismissed());
+        let removed = match claude_projection(ClaudeStatus::Idle, false) {
+            BeaconEvent::ClaudeStateProjection(projection) => projection.session,
+            _ => unreachable!("fixture is a Claude projection"),
+        };
+        model.apply_at(BeaconEvent::ClaudeSessionRemoved(removed), now);
+        assert_eq!(model.rows.len(), 1);
+        assert!(model.dismissal_status.is_none());
+    }
 
     fn endpoint(port: u16) -> ServerEndpoint {
         ServerEndpoint::new(SocketAddr::from(([127, 0, 0, 1], port)))
@@ -1739,6 +2132,7 @@ mod tests {
             continue_session: false,
             focus: Some(FocusTarget {
                 process,
+                source: crate::attachment::FocusProcessSource::OpenCode,
                 client: crate::attachment::ClientFocusTarget::Konsole(
                     crate::attachment::KonsoleTarget {
                         service: ":1.108".to_owned(),
@@ -1831,16 +2225,17 @@ mod tests {
             AttachmentSnapshot {
                 tuis: vec![attached],
                 v1_focus: HashMap::new(),
+                claude_focus: HashMap::new(),
                 diagnostic: None,
             },
             Instant::now(),
         );
 
         assert!(model.rows.iter().any(|row| {
-            row.key.root_session_id == "root" && row.category == RowCategory::Attached && !row.busy
+            row.session_id == "root" && row.category == RowCategory::Attached && !row.busy
         }));
         assert!(model.rows.iter().any(|row| {
-            row.key.root_session_id == "busy" && row.category == RowCategory::Headless && row.busy
+            row.session_id == "busy" && row.category == RowCategory::Headless && row.busy
         }));
         let buffer = rendered(&mut model, 140, 10);
         assert!(format!("{buffer:?}").contains("attached"));
@@ -1918,7 +2313,7 @@ mod tests {
             model
                 .rows
                 .iter()
-                .map(|row| (row.category, row.key.root_session_id.as_str()))
+                .map(|row| (row.category, row.session_id.as_str()))
                 .collect::<Vec<_>>(),
             [
                 (RowCategory::V1, "v1"),
@@ -1969,7 +2364,7 @@ mod tests {
             model
                 .rows
                 .iter()
-                .map(|row| row.key.root_session_id.clone())
+                .map(|row| row.session_id.clone())
                 .collect::<Vec<_>>()
         };
         let mut model = DashboardModel::default();
@@ -1990,9 +2385,7 @@ mod tests {
         ));
         assert_eq!(ids(&model), ["second", "selected", "first"]);
         assert_eq!(
-            model.rows[model.selected.unwrap_or_default()]
-                .key
-                .root_session_id,
+            model.rows[model.selected.unwrap_or_default()].session_id,
             "selected"
         );
 
@@ -2033,13 +2426,17 @@ mod tests {
             AttachmentSnapshot {
                 tuis: vec![tui(&instance, 902, "/workspace")],
                 v1_focus: HashMap::new(),
+                claude_focus: HashMap::new(),
                 diagnostic: None,
             },
             Instant::now(),
         );
-        assert!(model.rows.iter().any(|row| {
-            row.key.root_session_id == "root" && row.category == RowCategory::Attached
-        }));
+        assert!(
+            model
+                .rows
+                .iter()
+                .any(|row| { row.session_id == "root" && row.category == RowCategory::Attached })
+        );
         assert!(!model.rows.iter().any(|row| row.category == RowCategory::V1));
     }
 
@@ -2116,13 +2513,14 @@ mod tests {
             AttachmentSnapshot {
                 tuis: vec![tui(&instance, 921, "/workspace")],
                 v1_focus: HashMap::new(),
+                claude_focus: HashMap::new(),
                 diagnostic: None,
             },
             Instant::now(),
         );
         assert_eq!(model.rows.len(), 1);
         assert_eq!(model.rows[0].category, RowCategory::Attached);
-        assert_eq!(model.rows[0].key.root_session_id, "first");
+        assert_eq!(model.rows[0].session_id, "first");
         assert_eq!(model.rows[0].tui.map(|key| key.pid), Some(921));
         assert_eq!(model.rows[0].background_count, 1);
         assert!(
@@ -2154,6 +2552,7 @@ mod tests {
             AttachmentSnapshot {
                 tuis: vec![tui(&instance, 931, "/workspace")],
                 v1_focus: HashMap::new(),
+                claude_focus: HashMap::new(),
                 diagnostic: None,
             },
             Instant::now(),
@@ -2161,7 +2560,7 @@ mod tests {
 
         assert_eq!(model.rows.len(), 1);
         assert_eq!(model.rows[0].category, RowCategory::Attached);
-        assert_eq!(model.rows[0].key.root_session_id, "active");
+        assert_eq!(model.rows[0].session_id, "active");
         assert!(model.rows[0].busy);
         let screenshot = format!("{:?}", rendered(&mut model, 140, 8));
         assert!(screenshot.contains("attached"));
@@ -2199,6 +2598,7 @@ mod tests {
                     tui(&instance, 924, "/workspace"),
                 ],
                 v1_focus: HashMap::new(),
+                claude_focus: HashMap::new(),
                 diagnostic: None,
             },
             Instant::now(),
@@ -2212,9 +2612,12 @@ mod tests {
                 .count(),
             2
         );
-        assert!(model.rows.iter().any(|row| {
-            row.category == RowCategory::Headless && row.key.root_session_id == "busy"
-        }));
+        assert!(
+            model
+                .rows
+                .iter()
+                .any(|row| { row.category == RowCategory::Headless && row.session_id == "busy" })
+        );
         assert!(
             !model
                 .rows
@@ -2256,6 +2659,7 @@ mod tests {
             AttachmentSnapshot {
                 tuis: vec![tui(&instance, 929, "/shared")],
                 v1_focus: HashMap::new(),
+                claude_focus: HashMap::new(),
                 diagnostic: None,
             },
             Instant::now(),
@@ -2309,6 +2713,7 @@ mod tests {
             AttachmentSnapshot {
                 tuis: vec![tui(&instance, 926, "/workspace")],
                 v1_focus: HashMap::new(),
+                claude_focus: HashMap::new(),
                 diagnostic: None,
             },
             Instant::now(),
@@ -2325,7 +2730,7 @@ mod tests {
 
         assert_eq!(model.rows.len(), 1);
         assert_eq!(model.rows[0].category, RowCategory::Attached);
-        assert_eq!(model.rows[0].key.root_session_id, "active");
+        assert_eq!(model.rows[0].session_id, "active");
         assert!(!model.rows[0].busy);
         assert_eq!(
             model
@@ -2388,7 +2793,7 @@ mod tests {
                 .rows
                 .iter()
                 .find(|row| row.tui == Some(tui_key))
-                .map(|row| row.key.root_session_id.as_str()),
+                .map(|row| row.session_id.as_str()),
             Some("second")
         );
         assert_eq!(
@@ -2419,7 +2824,7 @@ mod tests {
             .unwrap_or_else(|| unreachable!("headless row"));
         assert_eq!(
             (
-                headless.key.root_session_id.as_str(),
+                headless.session_id.as_str(),
                 headless.attachment_stale,
                 headless.tui,
                 headless.focus.as_ref()
@@ -2441,9 +2846,12 @@ mod tests {
         );
         model.apply_attachments(AttachmentSnapshot::default(), Instant::now());
         assert!(model.sticky_attachments.is_empty());
-        assert!(model.rows.iter().any(|row| {
-            row.category == RowCategory::Headless && row.key.root_session_id == "first"
-        }));
+        assert!(
+            model
+                .rows
+                .iter()
+                .any(|row| { row.category == RowCategory::Headless && row.session_id == "first" })
+        );
 
         model.apply_attachments(
             AttachmentSnapshot {
@@ -2477,7 +2885,7 @@ mod tests {
         model.apply(found(instance.clone(), endpoint));
         model.apply(projection(instance, endpoint, vec![root, child]));
         assert!(model.rows.iter().any(|row| {
-            row.key.root_session_id == "root"
+            row.session_id == "root"
                 && row.category == RowCategory::Headless
                 && !row.busy
                 && row.background_count == 1
@@ -2485,7 +2893,7 @@ mod tests {
         let row = model
             .rows
             .iter()
-            .find(|row| row.key.root_session_id == "root")
+            .find(|row| row.session_id == "root")
             .unwrap_or_else(|| unreachable!("headless background root"));
         assert!(row.last_non_busy.is_some());
         assert_eq!(
@@ -2506,7 +2914,7 @@ mod tests {
         model.apply_at(projection(instance, endpoint, vec![root]), start);
         assert_eq!(model.rows.len(), 1);
         assert_eq!(model.rows[0].category, RowCategory::Headless);
-        assert_eq!(model.rows[0].key.root_session_id, "root");
+        assert_eq!(model.rows[0].session_id, "root");
         assert!(model.rows[0].busy);
         assert_eq!(
             state_line(
@@ -2562,10 +2970,7 @@ mod tests {
         let now = Instant::now();
         let make = |busy, retry, background_count| {
             let mut row = new_row(
-                RowKey {
-                    instance: managed_key(940, 4140),
-                    root_session_id: "root".to_owned(),
-                },
+                RowKey::opencode(managed_key(940, 4140), "root".to_owned()),
                 endpoint(4140),
                 &RootAggregate {
                     id: "root".to_owned(),
@@ -2614,10 +3019,7 @@ mod tests {
             .next()
             .unwrap_or_else(|| unreachable!("root aggregate"));
         let mut row = new_row(
-            RowKey {
-                instance: managed_key(950, 4150),
-                root_session_id: "root".to_owned(),
-            },
+            RowKey::opencode(managed_key(950, 4150), "root".to_owned()),
             endpoint(4150),
             &aggregate,
             Some(now),
@@ -2658,6 +3060,7 @@ mod tests {
             AttachmentSnapshot {
                 tuis: vec![attached],
                 v1_focus: HashMap::new(),
+                claude_focus: HashMap::new(),
                 diagnostic: None,
             },
             now,
@@ -2715,6 +3118,7 @@ mod tests {
             AttachmentSnapshot {
                 tuis: vec![tui(&instance, 971, "/unmatched")],
                 v1_focus: HashMap::new(),
+                claude_focus: HashMap::new(),
                 diagnostic: None,
             },
             Instant::now(),
@@ -2900,16 +3304,11 @@ mod tests {
             model
                 .rows
                 .iter()
-                .map(|row| row.key.root_session_id.as_str())
+                .map(|row| row.session_id.as_str())
                 .collect::<Vec<_>>(),
             ["b", "a"]
         );
-        assert!(
-            model
-                .rows
-                .iter()
-                .all(|row| row.key.root_session_id != "idle")
-        );
+        assert!(model.rows.iter().all(|row| row.session_id != "idle"));
 
         model.apply(projection(
             instance,
@@ -2924,7 +3323,7 @@ mod tests {
             model
                 .rows
                 .iter()
-                .map(|row| row.key.root_session_id.as_str())
+                .map(|row| row.session_id.as_str())
                 .collect::<Vec<_>>(),
             ["a", "b"]
         );
@@ -2980,23 +3379,13 @@ mod tests {
         let root = model
             .rows
             .iter()
-            .find(|row| row.key.root_session_id == "root")
+            .find(|row| row.session_id == "root")
             .unwrap_or_else(|| unreachable!("root admitted"));
         assert_eq!(root.marker(), "question");
         assert_eq!(root.question_ids, ["q"]);
         assert_eq!(root.permission_ids, ["p"]);
-        assert!(
-            model
-                .rows
-                .iter()
-                .any(|row| row.key.root_session_id == "missing")
-        );
-        assert!(
-            model
-                .rows
-                .iter()
-                .any(|row| row.key.root_session_id == "cycle-a")
-        );
+        assert!(model.rows.iter().any(|row| row.session_id == "missing"));
+        assert!(model.rows.iter().any(|row| row.session_id == "cycle-a"));
     }
 
     #[test]
@@ -3225,7 +3614,7 @@ mod tests {
                 &[],
             )],
         ));
-        assert_eq!(model.rows[0].key.instance, second);
+        assert_eq!(model.rows[0].key.instance(), Some(&second));
     }
 
     #[test]
@@ -3243,10 +3632,7 @@ mod tests {
             Some(Color::Green)
         );
         let row = new_row(
-            RowKey {
-                instance: key(7, 4007),
-                root_session_id: "root".to_owned(),
-            },
+            RowKey::opencode(key(7, 4007), "root".to_owned()),
             endpoint(4007),
             &RootAggregate {
                 id: "root".to_owned(),
@@ -3972,6 +4358,7 @@ mod tests {
             AttachmentSnapshot {
                 tuis: vec![attached],
                 v1_focus: HashMap::new(),
+                claude_focus: HashMap::new(),
                 diagnostic: None,
             },
             Instant::now(),
@@ -4027,6 +4414,7 @@ mod tests {
         };
         let target = FocusTarget {
             process,
+            source: crate::attachment::FocusProcessSource::OpenCode,
             client: crate::attachment::ClientFocusTarget::Konsole(
                 crate::attachment::KonsoleTarget {
                     service: ":1.108".to_owned(),
@@ -4039,6 +4427,7 @@ mod tests {
             AttachmentSnapshot {
                 tuis: Vec::new(),
                 v1_focus: HashMap::from([(key(22, 4022), target.clone())]),
+                claude_focus: HashMap::new(),
                 diagnostic: None,
             },
             Instant::now(),
@@ -4055,6 +4444,7 @@ mod tests {
 
         let kitty = FocusTarget {
             process,
+            source: crate::attachment::FocusProcessSource::OpenCode,
             client: crate::attachment::ClientFocusTarget::Kitty(crate::attachment::KittyTarget {
                 process: TuiKey {
                     pid: 500,
@@ -4070,6 +4460,7 @@ mod tests {
             AttachmentSnapshot {
                 tuis: Vec::new(),
                 v1_focus: HashMap::from([(key(22, 4022), kitty.clone())]),
+                claude_focus: HashMap::new(),
                 diagnostic: None,
             },
             Instant::now(),
@@ -4121,6 +4512,7 @@ mod tests {
             AttachmentSnapshot {
                 tuis: vec![unresolved],
                 v1_focus: HashMap::new(),
+                claude_focus: HashMap::new(),
                 diagnostic: None,
             },
             Instant::now(),
@@ -4142,6 +4534,7 @@ mod tests {
         let mut ambiguous = tui(&instance, 26, "/workspace");
         ambiguous.focus = Some(FocusTarget {
             process: ambiguous.key,
+            source: crate::attachment::FocusProcessSource::OpenCode,
             client: crate::attachment::ClientFocusTarget::Konsole(
                 crate::attachment::KonsoleTarget {
                     service: ":1.108".to_owned(),
@@ -4156,6 +4549,7 @@ mod tests {
             AttachmentSnapshot {
                 tuis: vec![ambiguous, second],
                 v1_focus: HashMap::new(),
+                claude_focus: HashMap::new(),
                 diagnostic: None,
             },
             Instant::now(),
@@ -4179,6 +4573,7 @@ mod tests {
             AttachmentSnapshot {
                 tuis: vec![attached],
                 v1_focus: HashMap::new(),
+                claude_focus: HashMap::new(),
                 diagnostic: None,
             },
             Instant::now(),
@@ -4206,6 +4601,7 @@ mod tests {
                 pid: 24,
                 start_time: 240,
             },
+            source: crate::attachment::FocusProcessSource::OpenCode,
             client: crate::attachment::ClientFocusTarget::Konsole(
                 crate::attachment::KonsoleTarget {
                     service: ":1.108".to_owned(),
@@ -4220,6 +4616,7 @@ mod tests {
             AttachmentSnapshot {
                 tuis: Vec::new(),
                 v1_focus: HashMap::from([(instance.clone(), target)]),
+                claude_focus: HashMap::new(),
                 diagnostic: None,
             },
             Instant::now(),

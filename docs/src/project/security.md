@@ -1,5 +1,25 @@
 # Security
 
+Claude monitoring is enabled by default and can be disabled with CLI
+`--no-claude` or programmatic configuration. When enabled, it reads only exact
+per-PID marker names from the resolved Claude configuration directory.
+Markers must be regular, current-effective-UID-owned files no larger than 64
+KiB. Filename PID, JSON PID, same-UID procfs identity, exact `claude` executable
+basename (or argv-zero fallback), and PID starttime are validated around the
+read. Final marker opens reject symlinks and raced special files, and marker
+identity plus change metadata remain stable through the bounded read. Proc stat,
+status, and the argv fallback are separately bounded. Procfs and marker
+inspection are not atomic and same-UID processes remain trusted local principals.
+
+Only PID/starttime, bounded session ID, absolute cwd, bounded optional name, and
+normalized status are retained. Marker `waitingFor`, unknown fields, and file
+contents are discarded. Beacon never opens Claude transcripts, process
+environments outside the dashboard focus-evidence exception below, daemon logs,
+or background-job state; never installs hooks or changes settings; never invokes
+the Claude CLI or session-control commands; and makes no Claude-provider network
+request. Cwd, name, and session ID remain sensitive even after terminal-control
+sanitization.
+
 Only loopback HTTP endpoints are constructed.
 Redirects are disabled so Basic credentials cannot be forwarded.
 V1 passwords come from Beacon's configured environment variable. Managed v2
@@ -69,7 +89,18 @@ extraction from its exact stable process; managed service PIDs are excluded. Att
 evidence is never sent to OpenCode and remains display confidence, not an
 authentication or authorization boundary.
 
+Dashboard applies that same environment allowlist to an exact Claude
+PID/starttime learned from provider lifecycle events. Before retaining a target,
+it requires current effective UID, stable PID/starttime, nonzero TTY, and exact
+`claude` executable basename or bounded argv-zero fallback around the bounded
+environment read. It stores only `ClientFocusTarget` identifiers, never the broad
+environment. Missing evidence produces no focus target.
+
 Focus revalidates PID/starttime and D-Bus ownership immediately before acting.
+For Claude provenance, every process revalidation also repeats effective UID,
+TTY, exact process classification, and equality of freshly extracted allowlisted
+identifiers. PID reuse, exec replacement, changed terminal identifiers, or an
+unreadable/oversized environment fails before external commands.
 It selects a tab only through its exact retained D-Bus window after fresh session
 membership validation. All external commands use fixed argument vectors without
 a shell. The generated KWin script source is repository-owned, substitutes only

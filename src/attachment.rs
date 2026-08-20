@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
@@ -13,6 +13,10 @@ use opencode_beacon::model::{
 };
 
 const MAX_PROCESS_ENVIRONMENT_SIZE: u64 = 256 * 1024;
+const MAX_PROCESS_STAT_SIZE: u64 = 8 * 1024;
+const MAX_PROCESS_STATUS_SIZE: u64 = 64 * 1024;
+const MAX_PROCESS_CMDLINE_SIZE: u64 = 64 * 1024;
+const MAX_UNIX_SOCKET_TABLE_SIZE: u64 = 1024 * 1024;
 const MAX_KONSOLE_IDENTIFIER_SIZE: usize = 128;
 const MAX_KITTY_PID_SIZE: usize = 10;
 const MAX_KITTY_WINDOW_ID_SIZE: usize = 20;
@@ -47,9 +51,16 @@ pub enum ClientFocusTarget {
     Kitty(KittyTarget),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FocusProcessSource {
+    OpenCode,
+    Claude,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FocusTarget {
     pub process: TuiKey,
+    pub source: FocusProcessSource,
     pub client: ClientFocusTarget,
 }
 
@@ -76,6 +87,7 @@ pub struct LikelyTui {
 pub struct AttachmentSnapshot {
     pub tuis: Vec<LikelyTui>,
     pub v1_focus: HashMap<InstanceKey, FocusTarget>,
+    pub claude_focus: HashMap<TuiKey, FocusTarget>,
     pub diagnostic: Option<String>,
 }
 
@@ -101,6 +113,7 @@ pub struct AttachmentSampler {
     proc_root: PathBuf,
     targets: HashMap<ServerEndpoint, V2Target>,
     v1_targets: HashMap<InstanceKey, V1Target>,
+    claude_targets: HashSet<TuiKey>,
     retained: HashMap<TuiKey, RetainedTui>,
 }
 
@@ -116,6 +129,7 @@ impl AttachmentSampler {
             proc_root,
             targets: HashMap::new(),
             v1_targets: HashMap::new(),
+            claude_targets: HashSet::new(),
             retained: HashMap::new(),
         }
     }
@@ -158,19 +172,33 @@ impl AttachmentSampler {
                 self.retained
                     .retain(|_, retained| retained.tui.instance != instance.key);
             }
+            BeaconEvent::ClaudeSessionFound(session) => {
+                self.claude_targets.insert(TuiKey {
+                    pid: session.key.pid,
+                    start_time: session.key.start_time,
+                });
+            }
+            BeaconEvent::ClaudeSessionRemoved(session) => {
+                self.claude_targets.remove(&TuiKey {
+                    pid: session.key.pid,
+                    start_time: session.key.start_time,
+                });
+            }
             _ => {}
         }
     }
 
     pub fn sample(&mut self) -> AttachmentSnapshot {
-        match scan(&self.proc_root, &self.targets) {
+        let mut snapshot = match scan(&self.proc_root, &self.targets) {
             Ok(observed) => {
                 let mut snapshot = self.apply_success(observed);
                 snapshot.v1_focus = scan_v1_focus(&self.proc_root, &mut self.v1_targets);
                 snapshot
             }
             Err(error) => self.apply_failure(&error),
-        }
+        };
+        snapshot.claude_focus = scan_claude_focus(&self.proc_root, &self.claude_targets);
+        snapshot
     }
 
     fn apply_success(&mut self, observed: Vec<LikelyTui>) -> AttachmentSnapshot {
@@ -190,6 +218,7 @@ impl AttachmentSampler {
         AttachmentSnapshot {
             tuis: self.current(),
             v1_focus: HashMap::new(),
+            claude_focus: HashMap::new(),
             diagnostic: None,
         }
     }
@@ -201,6 +230,7 @@ impl AttachmentSampler {
         AttachmentSnapshot {
             tuis: self.current(),
             v1_focus: HashMap::new(),
+            claude_focus: HashMap::new(),
             diagnostic: Some(format!("v2 TUI attachment scan failed: {error}")),
         }
     }
@@ -333,7 +363,7 @@ fn scan(
             pid,
             start_time: before.start_time,
         };
-        let focus = read_focus_target(proc_root, &process, key);
+        let focus = read_focus_target(proc_root, &process, key, FocusProcessSource::OpenCode);
         tuis.insert(
             key,
             LikelyTui {
@@ -394,6 +424,7 @@ fn scan_v1_focus(
                     pid: target.pid,
                     start_time: before.start_time,
                 },
+                FocusProcessSource::OpenCode,
             )?;
             if read_process_stat(&process).ok().as_ref() != Some(&before)
                 || fs::metadata(process.join("ns/net"))
@@ -406,6 +437,17 @@ fn scan_v1_focus(
             }
             target.start_time = Some(before.start_time);
             Some((instance.clone(), focus))
+        })
+        .collect()
+}
+
+fn scan_claude_focus(proc_root: &Path, targets: &HashSet<TuiKey>) -> HashMap<TuiKey, FocusTarget> {
+    targets
+        .iter()
+        .filter_map(|key| {
+            let process = proc_root.join(key.pid.to_string());
+            let target = read_focus_target(proc_root, &process, *key, FocusProcessSource::Claude)?;
+            focus_process_matches(proc_root, &target).then_some((*key, target))
         })
         .collect()
 }
@@ -502,16 +544,23 @@ fn set_unique(slot: &mut Option<Vec<u8>>, value: &[u8], max_size: usize) -> bool
     true
 }
 
-fn read_focus_target(proc_root: &Path, process: &Path, key: TuiKey) -> Option<FocusTarget> {
+fn read_focus_target(
+    proc_root: &Path,
+    process: &Path,
+    key: TuiKey,
+    source: FocusProcessSource,
+) -> Option<FocusTarget> {
     let environment = read_focus_environment(process)?;
     if let Some(kitty) = kitty_target_from_environment(proc_root, key, &environment) {
         return Some(FocusTarget {
             process: key,
+            source,
             client: ClientFocusTarget::Kitty(kitty),
         });
     }
     konsole_target_from_environment(&environment).map(|konsole| FocusTarget {
         process: key,
+        source,
         client: ClientFocusTarget::Konsole(konsole),
     })
 }
@@ -656,9 +705,10 @@ pub fn kitty_target_matches(proc_root: &Path, tui: TuiKey, target: &KittyTarget)
     if before.dev() != target.socket_device || before.ino() != target.socket_inode {
         return false;
     }
-    let Some(socket_inode) = fs::read_to_string(kitty.join("net/unix"))
-        .ok()
-        .and_then(|contents| unix_listener_inode(&contents, &target.socket_path))
+    let Some(socket_inode) =
+        read_bounded_string(kitty.join("net/unix"), MAX_UNIX_SOCKET_TABLE_SIZE)
+            .ok()
+            .and_then(|contents| unix_listener_inode(&contents, &target.socket_path))
     else {
         return false;
     };
@@ -735,6 +785,66 @@ pub fn process_matches(proc_root: &Path, key: TuiKey) -> bool {
         .is_ok_and(|stat| stat.pid == key.pid && stat.start_time == key.start_time)
 }
 
+pub fn focus_process_matches(proc_root: &Path, target: &FocusTarget) -> bool {
+    match target.source {
+        FocusProcessSource::OpenCode => process_matches(proc_root, target.process),
+        FocusProcessSource::Claude => claude_focus_process_matches(proc_root, target),
+    }
+}
+
+fn claude_focus_process_matches(proc_root: &Path, target: &FocusTarget) -> bool {
+    let self_root = proc_root.join("self");
+    let process = proc_root.join(target.process.pid.to_string());
+    let Some(uid) = effective_uid(&self_root).ok() else {
+        return false;
+    };
+    let Some(before) = read_process_stat(&process).ok() else {
+        return false;
+    };
+    if before.pid != target.process.pid
+        || before.start_time != target.process.start_time
+        || before.tty == 0
+        || effective_uid(&process).ok() != Some(uid)
+        || !is_claude_process(&process)
+    {
+        return false;
+    }
+    let identifiers_match = read_focus_environment(&process)
+        .as_ref()
+        .is_some_and(|environment| match &target.client {
+            ClientFocusTarget::Konsole(konsole) => {
+                konsole_target_from_environment(environment).as_ref() == Some(konsole)
+            }
+            ClientFocusTarget::Kitty(kitty) => kitty_identifiers_match(environment, kitty),
+        });
+    identifiers_match
+        && read_process_stat(&process).ok().as_ref() == Some(&before)
+        && effective_uid(&process).ok() == Some(uid)
+        && is_claude_process(&process)
+}
+
+fn is_claude_process(process: &Path) -> bool {
+    fs::read_link(process.join("exe")).map_or_else(
+        |_| {
+            read_bounded(process.join("cmdline"), MAX_PROCESS_CMDLINE_SIZE)
+                .ok()
+                .and_then(|cmdline| {
+                    cmdline
+                        .split(|byte| *byte == 0)
+                        .next()
+                        .map(ToOwned::to_owned)
+                })
+                .and_then(|argument| {
+                    PathBuf::from(OsString::from_vec(argument))
+                        .file_name()
+                        .map(ToOwned::to_owned)
+                })
+                .is_some_and(|name| name == "claude")
+        },
+        |executable| executable.file_name() == Some(OsStr::new("claude")),
+    )
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ProcessStat {
     pid: u32,
@@ -743,7 +853,10 @@ struct ProcessStat {
 }
 
 fn read_process_stat(process: &Path) -> io::Result<ProcessStat> {
-    parse_process_stat(&fs::read_to_string(process.join("stat"))?)
+    parse_process_stat(&read_bounded_string(
+        process.join("stat"),
+        MAX_PROCESS_STAT_SIZE,
+    )?)
 }
 
 fn parse_process_stat(contents: &str) -> io::Result<ProcessStat> {
@@ -765,7 +878,7 @@ fn parse_process_stat(contents: &str) -> io::Result<ProcessStat> {
 }
 
 fn read_argv(process: &Path) -> io::Result<Vec<OsString>> {
-    let bytes = fs::read(process.join("cmdline"))?;
+    let bytes = read_bounded(process.join("cmdline"), MAX_PROCESS_CMDLINE_SIZE)?;
     let argv = bytes
         .split(|byte| *byte == 0)
         .filter(|argument| !argument.is_empty())
@@ -902,13 +1015,27 @@ fn parse_proc_address(value: &str, ipv6: bool) -> io::Result<SocketAddr> {
 }
 
 fn effective_uid(process: &Path) -> io::Result<u32> {
-    fs::read_to_string(process.join("status"))?
+    read_bounded_string(process.join("status"), MAX_PROCESS_STATUS_SIZE)?
         .lines()
         .find_map(|line| line.strip_prefix("Uid:"))
         .and_then(|uids| uids.split_whitespace().nth(1))
         .ok_or_else(|| invalid("status has no effective UID"))?
         .parse()
         .map_err(invalid_data)
+}
+
+fn read_bounded(path: impl AsRef<Path>, limit: u64) -> io::Result<Vec<u8>> {
+    let mut reader = File::open(path)?.take(limit + 1);
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > limit {
+        return Err(invalid("file exceeds safety limit"));
+    }
+    Ok(bytes)
+}
+
+fn read_bounded_string(path: impl AsRef<Path>, limit: u64) -> io::Result<String> {
+    String::from_utf8(read_bounded(path, limit)?).map_err(invalid_data)
 }
 
 fn invalid(message: &'static str) -> io::Error {
@@ -925,7 +1052,7 @@ mod tests {
     use std::os::unix::net::UnixListener;
 
     use super::*;
-    use opencode_beacon::model::InstanceSource;
+    use opencode_beacon::model::{ClaudeSession, ClaudeSessionKey, InstanceSource};
 
     fn os(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
@@ -954,6 +1081,15 @@ mod tests {
             .is_ok()
         );
         process
+    }
+
+    fn claude_found(pid: u32, start_time: u64) -> BeaconEvent {
+        BeaconEvent::ClaudeSessionFound(ClaudeSession {
+            key: ClaudeSessionKey { pid, start_time },
+            session_id: format!("session-{pid}"),
+            cwd: PathBuf::from("/workspace"),
+            name: Some("Claude session".to_owned()),
+        })
     }
 
     fn kitty_fixture() -> (tempfile::TempDir, UnixListener, TuiKey, KittyTarget) {
@@ -1344,9 +1480,15 @@ mod tests {
         assert!(fs::write(process.join("environ"), environment).is_ok());
 
         assert_eq!(
-            read_focus_target(&directory.path().join("proc"), &process, tui),
+            read_focus_target(
+                &directory.path().join("proc"),
+                &process,
+                tui,
+                FocusProcessSource::OpenCode,
+            ),
             Some(FocusTarget {
                 process: tui,
+                source: FocusProcessSource::OpenCode,
                 client: ClientFocusTarget::Kitty(expected.clone()),
             })
         );
@@ -1355,6 +1497,123 @@ mod tests {
             tui,
             &expected
         ));
+    }
+
+    #[test]
+    fn claude_konsole_focus_requires_stable_uid_process_tty_and_identifiers() {
+        let directory = tempfile::tempdir()
+            .unwrap_or_else(|error| unreachable!("temporary directory: {error}"));
+        let proc_root = directory.path().join("proc");
+        let uid = fs::metadata(directory.path())
+            .unwrap_or_else(|error| unreachable!("metadata: {error}"))
+            .uid();
+        write_process(&proc_root, 999, 1, uid);
+        assert!(symlink("999", proc_root.join("self")).is_ok());
+        let process = write_process(&proc_root, 321, 700, uid);
+        assert!(fs::write(process.join("cmdline"), b"claude\0").is_ok());
+        let environment = b"KONSOLE_DBUS_SERVICE=:1.108\0KONSOLE_DBUS_SESSION=/Sessions/4\0KONSOLE_DBUS_WINDOW=/Windows/9\0SECRET_DO_NOT_RETAIN=sensitive\0";
+        assert!(fs::write(process.join("environ"), environment).is_ok());
+
+        let mut sampler = AttachmentSampler::new(proc_root.clone());
+        sampler.observe(&claude_found(321, 700));
+        let key = TuiKey {
+            pid: 321,
+            start_time: 700,
+        };
+        let target = sampler
+            .sample()
+            .claude_focus
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| unreachable!("validated Claude Konsole target"));
+        assert_eq!(target.source, FocusProcessSource::Claude);
+        assert!(matches!(target.client, ClientFocusTarget::Konsole(_)));
+        assert!(!format!("{target:?}").contains("sensitive"));
+        assert!(focus_process_matches(&proc_root, &target));
+
+        assert!(fs::write(
+            process.join("environ"),
+            b"KONSOLE_DBUS_SERVICE=:1.108\0KONSOLE_DBUS_SESSION=/Sessions/5\0KONSOLE_DBUS_WINDOW=/Windows/9\0"
+        ).is_ok());
+        assert!(!focus_process_matches(&proc_root, &target));
+        let changed = sampler
+            .sample()
+            .claude_focus
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| unreachable!("changed identifiers form a new valid target"));
+        assert_ne!(changed, target);
+        assert!(focus_process_matches(&proc_root, &changed));
+
+        assert!(fs::write(process.join("environ"), environment).is_ok());
+        assert!(
+            fs::write(
+                process.join("stat"),
+                format!("321 (process) S 1 0 0 7 {} 701\n", vec!["0"; 14].join(" "))
+            )
+            .is_ok()
+        );
+        assert!(!focus_process_matches(&proc_root, &target));
+        assert!(sampler.sample().claude_focus.is_empty());
+
+        assert!(
+            fs::write(
+                process.join("stat"),
+                format!("321 (process) S 1 0 0 7 {} 700\n", vec!["0"; 14].join(" "))
+            )
+            .is_ok()
+        );
+        assert!(fs::write(process.join("cmdline"), b"not-claude\0").is_ok());
+        assert!(sampler.sample().claude_focus.is_empty());
+        assert!(fs::write(process.join("cmdline"), b"claude\0").is_ok());
+        assert!(
+            fs::write(
+                process.join("stat"),
+                format!("321 (process) S 1 0 0 0 {} 700\n", vec!["0"; 14].join(" "))
+            )
+            .is_ok()
+        );
+        assert!(sampler.sample().claude_focus.is_empty());
+        assert!(
+            fs::write(
+                process.join("stat"),
+                format!("321 (process) S 1 0 0 7 {} 700\n", vec!["0"; 14].join(" "))
+            )
+            .is_ok()
+        );
+        assert!(
+            fs::write(
+                process.join("status"),
+                format!("Uid:\t{}\t{}\t{}\t{}\n", uid + 1, uid + 1, uid + 1, uid + 1)
+            )
+            .is_ok()
+        );
+        assert!(sampler.sample().claude_focus.is_empty());
+    }
+
+    #[test]
+    fn claude_kitty_focus_reuses_full_socket_validation_and_removal() {
+        let (directory, _listener, tui, expected) = kitty_fixture();
+        let proc_root = directory.path().join("proc");
+        assert!(fs::write(proc_root.join("123/cmdline"), b"claude\0").is_ok());
+        let mut sampler = AttachmentSampler::new(proc_root.clone());
+        sampler.observe(&claude_found(tui.pid, tui.start_time));
+
+        let snapshot = sampler.sample();
+        let focus = snapshot
+            .claude_focus
+            .get(&tui)
+            .unwrap_or_else(|| unreachable!("validated Claude Kitty target"));
+        assert_eq!(focus.source, FocusProcessSource::Claude);
+        assert_eq!(focus.client, ClientFocusTarget::Kitty(expected.clone()));
+        assert!(focus_process_matches(&proc_root, focus));
+        assert!(kitty_target_matches(&proc_root, tui, &expected));
+
+        let BeaconEvent::ClaudeSessionFound(session) = claude_found(tui.pid, tui.start_time) else {
+            unreachable!("fixture is a Claude lifecycle event");
+        };
+        sampler.observe(&BeaconEvent::ClaudeSessionRemoved(session));
+        assert!(sampler.sample().claude_focus.is_empty());
     }
 
     #[test]
@@ -1372,9 +1631,15 @@ mod tests {
             start_time: 100,
         };
         assert_eq!(
-            read_focus_target(directory.path(), &process, key),
+            read_focus_target(
+                directory.path(),
+                &process,
+                key,
+                FocusProcessSource::OpenCode,
+            ),
             Some(FocusTarget {
                 process: key,
+                source: FocusProcessSource::OpenCode,
                 client: ClientFocusTarget::Konsole(KonsoleTarget {
                     service: ":1.108".to_owned(),
                     session_path: "/Sessions/4".to_owned(),

@@ -1,5 +1,49 @@
 # Requirements
 
+Claude Code monitoring must be enabled by default in raw, watch, dashboard, and
+once modes and must run alongside, not instead of, the existing OpenCode
+providers. Global `--no-claude` must disable it for one CLI invocation, and
+programmatic `ClaudeConfig` must remain capable of disabling it. Disabling
+Claude must not disable or change public OpenCode event semantics.
+
+On Linux, Claude discovery must poll the configured Claude directory
+(`CLAUDE_CONFIG_DIR`, otherwise `$HOME/.claude`) for exact positive
+`sessions/<pid>.json` names. It must accept only bounded regular files owned by
+the effective UID, require filename and JSON PID agreement, and validate an
+exact `claude` executable basename or argv-zero fallback against a same-effective-
+UID procfs process. Proc stat PID/starttime and UID must remain stable around the
+marker read. Session ID and optional name must be bounded, cwd must be absolute,
+and unknown additive fields or statuses must be tolerated without becoming
+activity claims.
+
+Claude `busy`, `working`, and `active` normalize to busy; `waiting` remains
+non-quiescent; `idle` is quiescent; every other value is unknown. Initial idle or
+unknown must not emit monitor/raw/watch ready. Initial busy or waiting arms the
+session without emitting ready. A later idle emits ready once; repeated idle
+does not. Unknown preserves uncertainty and must not claim ready. PID reuse must
+remove the old PID/starttime identity before adding its successor. One complete
+missing scan marks stale; two remove. A failed scan retains known sessions and
+does not count as a miss.
+
+Claude events must be additive provider-specific lifecycle, transition,
+attention, and projection variants without fabricated OpenCode endpoints or
+protocol values. They share monitor bounded FIFO backpressure, receiver-closure
+cancellation, runtime ownership, shutdown, and manual resync. Watch suppresses
+all non-attention Claude events and sanitizes names and IDs into one physical
+line. Dashboard admits every validated Claude session; initial idle is local
+dismissible ready generation zero. Claude rows must not expose memory
+attribution. A Claude focus action requires fresh dashboard-local validated
+terminal evidence; headless, stale, changed, or incomplete evidence must remain
+visibly unfocusable.
+
+Beacon must not parse Claude transcripts, install hooks, invoke `claude agents`,
+invoke session control, or access the network for Claude monitoring. Outside
+dashboard focus evidence it must not inspect Claude process environments.
+Dashboard may read one bounded environment from an exact stable same-UID Claude
+process and retain only the existing strict Konsole and Kitty allowlist. It must
+discard marker fields other than PID, session ID, cwd, optional name, and status,
+and must never expose `waitingFor` or arbitrary environment values.
+
 The reusable library and stdout binary must discover every qualifying v1 or v2
 standalone OpenCode TCP listener owned by the current user in the current Linux
 network namespace, and must simultaneously discover managed v2 central services
@@ -193,7 +237,7 @@ it. A failed scan retains prior TUI evidence as stale and does not count as a
 miss. Durable session deletion is not required for attachment removal.
 
 Dashboard rows must use stable group boundaries in this order: v1, attached v2,
-headless v2, then unresolved/ambiguous v2. Within each group rows sort by the
+headless v2, Claude, then unresolved/ambiguous v2. Within each group rows sort by the
 displayed title (session title, then the existing slug/session fallback), with
 session ID as the tie-breaker and endpoint as the deterministic final
 disambiguator. Status, attention, staleness, elapsed time, background count, and
@@ -242,19 +286,22 @@ otherwise eligible stable TUI process environment. It must discard every entry
 except strict bounded `KONSOLE_DBUS_SERVICE`, `KONSOLE_DBUS_SESSION`,
 `KONSOLE_DBUS_WINDOW`, `KITTY_PID`, `KITTY_WINDOW_ID`, and `KITTY_LISTEN_ON`
 identifiers and must not render or retain the broad environment. Procfs-backed
-v1 may collect the same identifiers from its exact PID after stable
-PID/starttime/TTY validation; managed service PIDs must not be treated as TUIs.
-Malformed or unvalidated Kitty evidence may fall back to complete valid Konsole
-evidence, while fully validated Kitty evidence takes precedence over inherited
-outer-terminal identifiers.
+v1 and Claude may collect the same identifiers from their exact PIDs after
+same-UID, stable PID/starttime, TTY, and provider process-identity validation;
+managed service PIDs must not be treated as TUIs. Malformed or unvalidated Kitty
+evidence may fall back to complete valid Konsole evidence, while fully validated
+Kitty evidence takes precedence over inherited outer-terminal identifiers.
 
 Enter must emit a focus action only for a connected, non-stale procfs-backed v1
-row or a non-stale high-confidence attached v2 row with a complete supported
-client-focus target. Missing selection/identifiers/targets, headless execution,
-unresolved or ambiguous association, stale evidence, PID reuse, and unsupported
-client interfaces must produce a clear safe no-op or error. The pure dashboard
-model must perform no D-Bus, process, or window side effect. At the binary
-boundary every backend must freshly validate PID/starttime. Konsole must verify
+row, a non-stale high-confidence attached v2 row, or a non-stale Claude row with
+a complete supported client-focus target. Missing selection/identifiers/targets,
+headless execution, unresolved or ambiguous association, stale evidence, PID
+reuse, and unsupported client interfaces must produce a clear safe no-op or
+error. The pure dashboard model must perform no D-Bus, process, or window side
+effect. At the binary boundary every backend must freshly validate PID/starttime.
+Claude must additionally revalidate same effective UID, nonzero TTY, exact
+`claude` executable basename or argv-zero fallback, and unchanged allowlisted
+environment identifiers before and during focus. Konsole must verify
 the D-Bus owner and exact tab/window, and select the tab with fixed arguments on
 the exact retained window. It may activate through KWin only when that D-Bus window is the
 process's sole window and there is a unique normal KWin window for that Konsole
