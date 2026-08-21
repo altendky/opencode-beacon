@@ -529,6 +529,10 @@ impl DashboardModel {
 
     fn apply_claude_projection(&mut self, projection: &ClaudeProjection, now: Instant) {
         let key = RowKey::Claude(projection.session.key);
+        if !projection.session.has_tty {
+            self.rows.retain(|row| row.key != key);
+            return;
+        }
         let busy = matches!(
             projection.status,
             ClaudeStatus::Busy | ClaudeStatus::Waiting
@@ -1890,6 +1894,7 @@ mod tests {
                 session_id: "claude-session".to_owned(),
                 cwd: PathBuf::from("/workspace/claude-project"),
                 name: Some("Claude project".to_owned()),
+                has_tty: true,
             },
             status,
             stale,
@@ -1998,6 +2003,29 @@ mod tests {
                 .map(|status| status.message.as_str()),
             Some("Cannot focus Claude project: Claude process evidence is stale")
         );
+    }
+
+    #[test]
+    fn claude_dashboard_omits_headless_sessions_and_removes_rows_that_lose_tty() {
+        let mut model = DashboardModel::default();
+        let now = Instant::now();
+        let BeaconEvent::ClaudeStateProjection(mut projection) =
+            claude_projection(ClaudeStatus::Idle, false)
+        else {
+            unreachable!("fixture is a Claude projection");
+        };
+        projection.session.has_tty = false;
+
+        model.apply_at(BeaconEvent::ClaudeStateProjection(projection.clone()), now);
+        assert!(model.rows.is_empty());
+
+        projection.session.has_tty = true;
+        model.apply_at(BeaconEvent::ClaudeStateProjection(projection.clone()), now);
+        assert_eq!(model.rows.len(), 1);
+
+        projection.session.has_tty = false;
+        model.apply_at(BeaconEvent::ClaudeStateProjection(projection), now);
+        assert!(model.rows.is_empty());
     }
 
     #[test]

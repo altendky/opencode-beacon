@@ -171,6 +171,7 @@ impl ClaudeDiscovery {
                 session_id: marker.session_id,
                 cwd: marker.cwd,
                 name: marker.name.filter(|name| !name.is_empty()),
+                has_tty: before.tty != 0,
             },
             status: normalize_status(marker.status.as_deref()),
         })
@@ -205,6 +206,7 @@ fn normalize_status(status: Option<&str>) -> ClaudeStatus {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ProcessStat {
     pid: u32,
+    tty: i64,
     start_time: u64,
 }
 
@@ -222,6 +224,7 @@ fn read_process_stat(process: &Path) -> io::Result<ProcessStat> {
     }
     Ok(ProcessStat {
         pid: contents[..open].trim().parse().map_err(invalid_data)?,
+        tty: fields[4].parse().map_err(invalid_data)?,
         start_time: fields[19].parse().map_err(invalid_data)?,
     })
 }
@@ -522,8 +525,8 @@ mod tests {
 
     use super::*;
 
-    fn process_stat(pid: u32, start_time: u64) -> String {
-        format!("{pid} (claude) S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 {start_time} 0\n")
+    fn process_stat(pid: u32, tty: i64, start_time: u64) -> String {
+        format!("{pid} (claude) S 0 0 0 {tty} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 {start_time} 0\n")
     }
 
     fn fixture() -> (tempfile::TempDir, ClaudeDiscovery, u32) {
@@ -569,7 +572,7 @@ mod tests {
             )
             .is_ok()
         );
-        assert!(fs::write(process.join("stat"), process_stat(pid, start_time)).is_ok());
+        assert!(fs::write(process.join("stat"), process_stat(pid, 0, start_time)).is_ok());
         let executable = directory.path().join("bin/claude");
         assert!(
             fs::create_dir_all(
@@ -611,6 +614,7 @@ mod tests {
                 session_id: format!("session-{pid}"),
                 cwd: PathBuf::from(format!("/workspace/{pid}")),
                 name: None,
+                has_tty: false,
             },
             status,
         }
@@ -627,6 +631,18 @@ mod tests {
             sessions,
             vec![observed_with_name(101, 900, ClaudeStatus::Busy)]
         );
+
+        assert!(
+            fs::write(
+                discovery.config.proc_root.join("101/stat"),
+                process_stat(101, 7, 900)
+            )
+            .is_ok()
+        );
+        let interactive = discovery
+            .discover()
+            .unwrap_or_else(|error| unreachable!("discover interactive: {error}"));
+        assert!(interactive[0].session.has_tty);
 
         assert!(fs::remove_file(discovery.config.proc_root.join("101/exe")).is_ok());
         let other = directory.path().join("bin/not-claude");
@@ -649,7 +665,7 @@ mod tests {
         assert!(
             fs::write(
                 discovery.config.proc_root.join("101/stat"),
-                process_stat(101, 901)
+                process_stat(101, 0, 901)
             )
             .is_ok()
         );
@@ -815,6 +831,19 @@ mod tests {
                 .iter()
                 .all(|event| !matches!(event, BeaconEvent::ClaudeAttention(_)))
         );
+    }
+
+    #[test]
+    fn headless_sessions_remain_in_provider_events() {
+        let mut tracker = ClaudeTracker::default();
+        let events = tracker.apply_success(vec![observed(1, 10, ClaudeStatus::Idle)]);
+
+        assert!(events.iter().any(|event| {
+            matches!(event, BeaconEvent::ClaudeSessionFound(session) if !session.has_tty)
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(event, BeaconEvent::ClaudeStateProjection(projection) if !projection.session.has_tty)
+        }));
     }
 
     #[test]

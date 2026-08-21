@@ -111,8 +111,9 @@ groups and canonical displayed-title/session ordering within each group; model
 updates restore selection by row identity after any required reorder. V1 retains its dedicated
 endpoint working-set behavior.
 
-Claude dashboard rows key directly by PID/starttime, display `ATTACH=claude`,
-and reuse local ready-generation and elapsed-time behavior. They have no
+Claude dashboard rows admit only processes with a controlling TTY, key directly
+by PID/starttime, display `ATTACH=claude`, and reuse local ready-generation and
+elapsed-time behavior. They have no
 OpenCode endpoint, TUI association, or memory scope. A row gains a focus target
 only while its exact live Claude process yields fully validated Konsole or Kitty
 evidence.

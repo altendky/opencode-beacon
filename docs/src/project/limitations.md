@@ -13,11 +13,13 @@
 - Claude monitoring covers live per-PID markers only. It does not parse saved
   transcripts or preserve completed background-agent history, and it does not
   invoke the slower `claude agents --json` interface.
-- Claude rows have no OpenCode attachment, cgroup-memory attribution,
-  prompt/question/permission classification, session control, or notifications.
+- Headless programmatic Claude sessions remain in monitor events but are omitted
+  from dashboard rows. Interactive Claude rows have no OpenCode attachment,
+  cgroup-memory attribution, prompt/question/permission classification, session
+  control, or notifications.
   Terminal focus is available only when the exact live Claude process has a TTY
-  and inherited complete supported Konsole or Kitty identifiers; headless,
-  stale, inaccessible, or incomplete evidence remains unfocusable. `waiting` is
+  and inherited complete supported Konsole or Kitty identifiers; stale,
+  inaccessible, or incomplete evidence remains unfocusable. `waiting` is
   non-quiescent but its potentially sensitive `waitingFor` detail is discarded.
 
 - Discovery supports Linux procfs v1 and v2 standalone listeners plus managed v2

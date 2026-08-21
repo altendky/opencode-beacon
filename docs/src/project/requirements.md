@@ -11,10 +11,10 @@ On Linux, Claude discovery must poll the configured Claude directory
 `sessions/<pid>.json` names. It must accept only bounded regular files owned by
 the effective UID, require filename and JSON PID agreement, and validate an
 exact `claude` executable basename or argv-zero fallback against a same-effective-
-UID procfs process. Proc stat PID/starttime and UID must remain stable around the
-marker read. Session ID and optional name must be bounded, cwd must be absolute,
-and unknown additive fields or statuses must be tolerated without becoming
-activity claims.
+UID procfs process. Proc stat PID/starttime/TTY and UID must remain stable around
+the marker read. Session ID and optional name must be bounded, cwd must be
+absolute, and unknown additive fields or statuses must be tolerated without
+becoming activity claims.
 
 Claude `busy`, `working`, and `active` normalize to busy; `waiting` remains
 non-quiescent; `idle` is quiescent; every other value is unknown. Initial idle or
@@ -30,11 +30,12 @@ attention, and projection variants without fabricated OpenCode endpoints or
 protocol values. They share monitor bounded FIFO backpressure, receiver-closure
 cancellation, runtime ownership, shutdown, and manual resync. Watch suppresses
 all non-attention Claude events and sanitizes names and IDs into one physical
-line. Dashboard admits every validated Claude session; initial idle is local
-dismissible ready generation zero. Claude rows must not expose memory
-attribution. A Claude focus action requires fresh dashboard-local validated
-terminal evidence; headless, stale, changed, or incomplete evidence must remain
-visibly unfocusable.
+line. Dashboard admits every validated Claude session with a controlling TTY;
+headless sessions remain available through provider events but do not create
+dashboard rows. Initial idle is local dismissible ready generation zero. Claude
+rows must not expose memory attribution. A Claude focus action requires fresh
+dashboard-local validated terminal evidence; stale, changed, or incomplete
+evidence must remain visibly unfocusable.
 
 Beacon must not parse Claude transcripts, install hooks, invoke `claude agents`,
 invoke session control, or access the network for Claude monitoring. Outside

@@ -258,6 +258,7 @@ pub struct ClaudeSession {
     pub session_id: String,
     pub cwd: PathBuf,
     pub name: Option<String>,
+    pub has_tty: bool,
 }
 
 impl ClaudeSession {

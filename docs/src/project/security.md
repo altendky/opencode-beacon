@@ -11,9 +11,9 @@ identity plus change metadata remain stable through the bounded read. Proc stat,
 status, and the argv fallback are separately bounded. Procfs and marker
 inspection are not atomic and same-UID processes remain trusted local principals.
 
-Only PID/starttime, bounded session ID, absolute cwd, bounded optional name, and
-normalized status are retained. Marker `waitingFor`, unknown fields, and file
-contents are discarded. Beacon never opens Claude transcripts, process
+Only PID/starttime, controlling-TTY presence, bounded session ID, absolute cwd,
+bounded optional name, and normalized status are retained. Marker `waitingFor`,
+unknown fields, and file contents are discarded. Beacon never opens Claude transcripts, process
 environments outside the dashboard focus-evidence exception below, daemon logs,
 or background-job state; never installs hooks or changes settings; never invokes
 the Claude CLI or session-control commands; and makes no Claude-provider network

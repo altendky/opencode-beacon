@@ -1081,6 +1081,7 @@ mod tests {
             session_id: "claude-session".to_owned(),
             cwd: std::path::PathBuf::from("/workspace/claude"),
             name: Some("Claude title".to_owned()),
+            has_tty: true,
         }
     }
 

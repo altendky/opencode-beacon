@@ -1103,6 +1103,7 @@ mod tests {
             session_id: format!("session-{pid}"),
             cwd: PathBuf::from("/workspace"),
             name: Some("Claude session".to_owned()),
+            has_tty: true,
         })
     }
 
